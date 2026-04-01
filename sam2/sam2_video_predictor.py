@@ -701,6 +701,71 @@ class SAM2VideoPredictor(SAM2Base):
         for v in inference_state["frames_tracked_per_obj"].values():
             v.clear()
 
+    def _iter_obj_indices(self, inference_state, obj_id=None):
+        """Yield object indices to operate on (all objects if obj_id is None)."""
+        if obj_id is None:
+            yield from inference_state["output_dict_per_obj"].keys()
+            return
+        obj_idx = inference_state["obj_id_to_idx"].get(obj_id, None)
+        if obj_idx is None:
+            return
+        yield obj_idx
+
+    @torch.inference_mode()
+    def promote_frame_output_to_cond(self, inference_state, frame_idx, obj_id=None):
+        """
+        Promote existing frame outputs to conditioning memory.
+        This enables long-term memory by pinning selected frames into
+        `cond_frame_outputs`, which are always preferred by memory retrieval.
+        """
+        for obj_idx in self._iter_obj_indices(inference_state, obj_id=obj_id):
+            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+            out = obj_output_dict["cond_frame_outputs"].get(frame_idx, None)
+            if out is None:
+                out = obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+            if out is not None:
+                obj_output_dict["cond_frame_outputs"][frame_idx] = out
+
+    @torch.inference_mode()
+    def demote_frame_output_from_cond(self, inference_state, frame_idx, obj_id=None):
+        """
+        Demote conditioning frame output to non-conditioning memory.
+        Useful when evicting long-term slots while keeping frame outputs available.
+        """
+        for obj_idx in self._iter_obj_indices(inference_state, obj_id=obj_id):
+            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+            out = obj_output_dict["cond_frame_outputs"].pop(frame_idx, None)
+            if out is not None:
+                obj_output_dict["non_cond_frame_outputs"][frame_idx] = out
+
+    @torch.inference_mode()
+    def prune_non_cond_memory(
+        self,
+        inference_state,
+        min_keep_frame_idx,
+        obj_id=None,
+        keep_cond=True,
+    ):
+        """
+        Remove stale non-conditioning memory to maintain a bounded working window.
+        """
+        for obj_idx in self._iter_obj_indices(inference_state, obj_id=obj_id):
+            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+            non_cond = obj_output_dict["non_cond_frame_outputs"]
+            drop_keys = [
+                k for k in list(non_cond.keys()) if isinstance(k, int) and k < min_keep_frame_idx
+            ]
+            for k in drop_keys:
+                non_cond.pop(k, None)
+
+            if not keep_cond:
+                cond = obj_output_dict["cond_frame_outputs"]
+                drop_cond_keys = [
+                    k for k in list(cond.keys()) if isinstance(k, int) and k < min_keep_frame_idx
+                ]
+                for k in drop_cond_keys:
+                    cond.pop(k, None)
+
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
         # Look up in the cache first

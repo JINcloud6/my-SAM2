@@ -121,39 +121,6 @@ def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
     return 0.7 * conf + 0.3 * stab
 
 
-def _safe_get_output_dict(state):
-    if not isinstance(state, dict):
-        return None
-    od = state.get("output_dict", None)
-    if not isinstance(od, dict):
-        return None
-    return od
-
-
-def prune_working_non_cond_outputs(state, min_keep_frame_idx):
-    """尽量裁剪 state 内过旧的 non-cond 输出，模拟working window。"""
-    od = _safe_get_output_dict(state)
-    if od is None:
-        return
-    nc = od.get("non_cond_frame_outputs", None)
-    if not isinstance(nc, dict):
-        return
-
-    drop_keys = [k for k in list(nc.keys()) if isinstance(k, int) and k < min_keep_frame_idx]
-    for k in drop_keys:
-        nc.pop(k, None)
-
-
-def remove_longterm_rep_from_cond_outputs(state, frame_idx):
-    od = _safe_get_output_dict(state)
-    if od is None:
-        return
-    c = od.get("cond_frame_outputs", None)
-    if not isinstance(c, dict):
-        return
-    c.pop(frame_idx, None)
-
-
 def promote_segment_to_longterm(
     video_predictor,
     state,
@@ -168,8 +135,8 @@ def promote_segment_to_longterm(
     if seg_q < args.longterm_quality_thr:
         return
 
-    # 将整个高质量段写入 SAM2 cond memory（而非仅代表帧）
-    # 同一frame若重复出现，仅保留该段内质量最高的mask。
+    # 将整个高质量段提升为 SAM2 cond memory（真正参与 memory attention）
+    # 同一 frame 若重复出现，仅保留该段内质量最高的结果。
     best_per_frame: Dict[int, FrameQuality] = {}
     for item in seg_frames:
         prev = best_per_frame.get(item.frame_idx, None)
@@ -181,20 +148,19 @@ def promote_segment_to_longterm(
         return
 
     for item in ordered_items:
-        video_predictor.add_new_mask(
-            state,
-            frame_idx=item.frame_idx,
-            obj_id=1,
-            mask=item.mask.astype(bool),
+        video_predictor.promote_frame_output_to_cond(
+            state, frame_idx=item.frame_idx, obj_id=1
         )
     longterm_bank.append(LongTermSegment(frame_items=ordered_items, seg_quality=seg_q))
 
-    # 若超容量，删掉质量最低 long-term 段（并从 cond outputs 尝试移除整段）
+    # 若超容量，降级质量最低 long-term 段
     while len(longterm_bank) > args.max_longterm_segments:
         worst_idx = int(np.argmin([x.seg_quality for x in longterm_bank]))
         worst = longterm_bank.pop(worst_idx)
         for item in worst.frame_items:
-            remove_longterm_rep_from_cond_outputs(state, item.frame_idx)
+            video_predictor.demote_frame_output_from_cond(
+                state, frame_idx=item.frame_idx, obj_id=1
+            )
 
 
 def build_frames_rgb(vol_man, axis, box, idx_list):
@@ -282,9 +248,14 @@ def longterm_track_one_direction(
                 seg_cache.append(FrameQuality(frame_idx=f_idx, mask=mm, quality=float(q)))
                 prev_mask = mm
 
-                # working窗口裁剪（近似）
+                # 裁剪 working memory（non-cond）
                 min_keep = max(0, f_idx - args.working_window)
-                prune_working_non_cond_outputs(state, min_keep_frame_idx=min_keep)
+                video_predictor.prune_non_cond_memory(
+                    state,
+                    min_keep_frame_idx=min_keep,
+                    obj_id=1,
+                    keep_cond=True,
+                )
 
                 # 到段尾就判断是否提升为long-term
                 if len(seg_cache) >= args.segment_len:
