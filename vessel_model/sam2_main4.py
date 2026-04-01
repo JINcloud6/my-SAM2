@@ -16,7 +16,7 @@ from .data_manager import VolumeManager
 from .preprocessing import get_multi_axis_init_seg, get_seeds_from_init_seg, get_seg
 from .sam2_baseline.predict_utils import map_local_point
 from .sam2_baseline.tracking import vos_track_one_direction
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
 def get_args():

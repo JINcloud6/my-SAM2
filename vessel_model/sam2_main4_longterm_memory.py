@@ -27,7 +27,7 @@ from .preprocessing import get_multi_axis_init_seg, get_seeds_from_init_seg, get
 from .sam2_baseline.image_utils import get_slice, to_uint8_rgb, write_jpeg_frames
 from .sam2_baseline.predict_utils import map_local_point
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 EPS = 1e-6
 
 
