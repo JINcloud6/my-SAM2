@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import List, Tuple
 
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 def parse_int_list(s: str) -> List[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
@@ -60,10 +60,10 @@ def main():
     parser.add_argument("--keep_tmp_vos_frames", action="store_true")
 
     # sweep lists
-    parser.add_argument("--segment_len_list", default="8,12,16")
-    parser.add_argument("--longterm_quality_thr_list", default="0.75,0.8,0.85")
+    parser.add_argument("--segment_len_list", default="5,20")
+    parser.add_argument("--longterm_quality_thr_list", default="0.75,0.85")
     parser.add_argument("--max_longterm_segments_list", default="3,5,8")
-    parser.add_argument("--max_global_inject_per_seed_list", default="2,4,6")
+    parser.add_argument("--max_global_inject_per_seed_list", default="0,2,6")
     parser.add_argument(
         "--dry_run",
         action="store_true",

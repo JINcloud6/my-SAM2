@@ -74,7 +74,7 @@ def get_args():
                         help="long-term最大段数")
     parser.add_argument("--working_window", type=int, default=24,
                         help="保留最近working输出帧数")
-    parser.add_argument("--max_global_inject_per_seed", type=int, default=6,
+    parser.add_argument("--max_global_inject_per_seed", type=int, default=0,
                         help="每个seed启动时最多注入的全局记忆帧数")
 
     parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
