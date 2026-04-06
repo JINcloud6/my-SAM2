@@ -8,7 +8,6 @@ By default this evaluates all 2^3 combinations on one volume and saves a CSV.
 """
 
 import argparse
-import csv
 import itertools
 import os
 import subprocess
@@ -18,21 +17,19 @@ from typing import Any, Dict, List, Tuple
 from .sweep_and_eval import calculate_all_metrics, load_data, print_metrics, save_results_to_csv
 
 
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-
-
 def bool_flag(v: bool) -> str:
     return "on" if v else "off"
 
 
 def build_ablation_combinations() -> List[Tuple[bool, bool, bool]]:
     return list(itertools.product([False, True], repeat=3))
+    # return list(itertools.product([True], [True], [True, False]))
 
 
-def make_result_name(use_joint_init: bool, use_respawn: bool, use_longterm: bool) -> str:
+def make_result_name(prefix: str, use_joint_init: bool, use_respawn: bool, use_longterm: bool) -> str:
+    prefix_str = f"{prefix}_" if prefix else ""
     return (
-        f"hybrid_ablation_"
+        f"{prefix_str}_hybrid_ablation_"
         f"joint_{bool_flag(use_joint_init)}_"
         f"respawn_{bool_flag(use_respawn)}_"
         f"ltmem_{bool_flag(use_longterm)}.nii.gz"
@@ -41,7 +38,8 @@ def make_result_name(use_joint_init: bool, use_respawn: bool, use_longterm: bool
 
 def main():
     parser = argparse.ArgumentParser()
-
+    parser.add_argument("--cuda_device", type=int, default=0,
+                        help="Physical CUDA device index forwarded to the hybrid script")
     parser.add_argument("--sam2_checkpoint", required=True)
     parser.add_argument("--sam2_model_cfg", required=True)
     parser.add_argument("--volume_path", required=True)
@@ -61,6 +59,7 @@ def main():
     parser.add_argument("--max_track_distance", type=int, default=2000)
     parser.add_argument("--max_init_mask_area", type=int, default=12000)
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
+    parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--init_half_window", type=int, default=6)
@@ -107,6 +106,8 @@ def main():
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--result_prefix", default="",
+                        help="Optional prefix inserted before each result filename, e.g. '07'")
     parser.add_argument("--csv_name", default="hybrid_ablation_metrics.csv")
     parser.add_argument("--sort_by", default="dice", choices=["precision", "recall", "accuracy", "f1", "dice", "iou"])
 
@@ -118,13 +119,14 @@ def main():
     all_results: List[Dict[str, Any]] = []
 
     for i, (use_joint_init, use_respawn, use_longterm) in enumerate(combos, start=1):
-        result_name = make_result_name(use_joint_init, use_respawn, use_longterm)
+        result_name = make_result_name(args.result_prefix, use_joint_init, use_respawn, use_longterm)
         result_path = os.path.join(args.output_dir, result_name)
 
         cmd = [
             sys.executable,
             "-m",
             "vessel_model.sam2_main4_hybrid",
+            "--cuda_device", str(args.cuda_device),
             "--sam2_checkpoint", args.sam2_checkpoint,
             "--sam2_model_cfg", args.sam2_model_cfg,
             "--volume_path", args.volume_path,
@@ -141,6 +143,7 @@ def main():
             "--max_track_distance", str(args.max_track_distance),
             "--max_init_mask_area", str(args.max_init_mask_area),
             "--max_segmented_seeds", str(args.max_segmented_seeds),
+            "--max_slice_mask_ratio", str(args.max_slice_mask_ratio),
             "--init_half_window", str(args.init_half_window),
             "--top_k", str(args.top_k),
             "--num_point_jitters", str(args.num_point_jitters),

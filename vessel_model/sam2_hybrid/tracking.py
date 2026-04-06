@@ -132,6 +132,7 @@ def track_one_direction_hybrid(
         "trusted_segments": 0,
         "untrusted_segments": 0,
         "final_untrusted_count": int(start_untrusted_count),
+        "terminated_large_mask": False,
     }
     if len(idx_list) == 0:
         return [], empty_stats
@@ -148,6 +149,7 @@ def track_one_direction_hybrid(
     promoted_segments = 0
     trusted_segments = 0
     untrusted_segments = 0
+    terminated_large_mask = False
 
     try:
         with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
@@ -254,6 +256,15 @@ def track_one_direction_hybrid(
                             spawned_tasks.append(task)
                         trust_seg_cache = []
                     continue
+
+                slice_area = float(mm.shape[0] * mm.shape[1])
+                if slice_area > 0:
+                    mask_ratio = float(mm.sum()) / slice_area
+                    if mask_ratio > float(args.max_slice_mask_ratio):
+                        terminated_large_mask = True
+                        trust_seg_cache = []
+                        seg_cache = []
+                        break
 
                 vol_man.update_global_mask(mm, axis, (gidx, *box[1:]))
                 q = frame_quality_from_logits(mm_logits, mm, prev_mask)
@@ -370,4 +381,5 @@ def track_one_direction_hybrid(
         "trusted_segments": trusted_segments,
         "untrusted_segments": untrusted_segments,
         "final_untrusted_count": int(start_untrusted_count) if not args.enable_respawn else current_untrusted_count,
+        "terminated_large_mask": terminated_large_mask,
     }

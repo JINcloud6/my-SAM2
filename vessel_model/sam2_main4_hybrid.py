@@ -25,11 +25,13 @@ from .sam2_hybrid.common import SeedTask, load_or_build_seeds
 from .sam2_hybrid.joint_init import prepare_basic_seed_init, prepare_seed_init
 from .sam2_hybrid.tracking import track_one_direction_hybrid
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
 
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--cuda_device", type=int, default=0,
+                        help="Physical CUDA device index to use when --device starts with 'cuda'")
     parser.add_argument("--sam2_checkpoint", required=True)
     parser.add_argument("--sam2_model_cfg", required=True)
     parser.add_argument("--volume_path", required=True)
@@ -48,6 +50,7 @@ def get_args():
     parser.add_argument("--max_track_distance", type=int, default=2000)
     parser.add_argument("--max_init_mask_area", type=int, default=12000)
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
+    parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--disable_joint_init", action="store_true")
@@ -96,10 +99,20 @@ def get_args():
     return parser.parse_args()
 
 
+def resolve_torch_device(args):
+    if str(args.device).lower() == "cpu":
+        return torch.device("cpu")
+    if str(args.device).startswith("cuda:"):
+        return torch.device(args.device)
+    if str(args.device).startswith("cuda"):
+        return torch.device(f"cuda:{args.cuda_device}")
+    return torch.device(args.device)
+
+
 def run_segmentation():
     args = get_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(args.device)
+    device = resolve_torch_device(args)
     rng = np.random.default_rng(args.random_seed)
 
     vol_man = VolumeManager(args.volume_path, key=args.dataset_key)
@@ -115,7 +128,12 @@ def run_segmentation():
 
     initial_seeds = load_or_build_seeds(args, vol_man)
     if not initial_seeds:
-        raise RuntimeError("No seeds available for SAM2 tracking.")
+        final_path = os.path.join(args.output_dir, args.output_filename)
+        flag = (args.need_transpose != "False")
+        print("No seeds available for SAM2 tracking. Saving empty mask.")
+        vol_man.save(final_path, flag)
+        print(f"Done! Saved empty mask to {final_path}")
+        return
 
     pending: Deque[SeedTask] = deque([SeedTask(seed=s, is_original=True) for s in initial_seeds])
     seen: Set[Tuple[int, int, int]] = set(initial_seeds)
