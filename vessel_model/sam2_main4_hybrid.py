@@ -5,9 +5,11 @@
 # - long-term memory + working memory + global memory injection
 import argparse
 import os
+import shutil
+import time
+import uuid
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Set, Tuple
+from typing import Deque, Optional, Set, Tuple
 
 import hydra
 import numpy as np
@@ -19,21 +21,10 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 from .data_manager import VolumeManager
 from .global_memory_pool import GlobalMemoryPool
-from .sam2_hybrid.axis_cache import (
-    build_all_axis_sequence_caches,
-    enable_precomputed_feature_cache,
-    prepare_axis_sequence_cache,
-    release_axis_sequence_cache,
-)
+from .sam2_hybrid.axis_cache import build_all_axis_sequence_caches, enable_precomputed_feature_cache
 from .sam2_hybrid.common import SeedTask, load_or_build_seeds
 from .sam2_hybrid.joint_init import prepare_basic_seed_init, prepare_seed_init
 from .sam2_hybrid.tracking import track_one_direction_hybrid
-
-
-@dataclass
-class PreparedSeedTask:
-    task: SeedTask
-    init_result: object
 
 
 def get_args():
@@ -50,11 +41,6 @@ def get_args():
     parser.add_argument("--output_dir", default="./bv_seg_output_hybrid")
     parser.add_argument("--output_filename", default="segmentation.nii.gz")
     parser.add_argument("--axis_sequence_cache_root", default=None)
-    parser.add_argument(
-        "--sequential_axis_cache",
-        action="store_true",
-        help="Only keep one axis image/feature cache in memory at a time.",
-    )
     parser.add_argument("--enable_axis_feature_cache", action="store_true")
     parser.add_argument("--feature_cache_device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--dataset_key", default="main")
@@ -130,23 +116,10 @@ def resolve_torch_device(args):
     return torch.device(args.device)
 
 
-def seed_should_skip(task, args, vol_man, covered_mask, trusted_mask) -> bool:
-    z, y, x = task.seed
-    if args.enable_respawn:
-        if task.is_original:
-            return bool(covered_mask[z, y, x] > 0)
-        return bool(trusted_mask[z, y, x] > 0)
-    return bool(vol_man.global_mask[z, y, x] > 0)
-
-
-def prepare_seed_task(task, img_predictor, vol_man, args, rng) -> Optional[PreparedSeedTask]:
+def prepare_init_result(task: SeedTask, img_predictor, vol_man, args, rng) -> Optional[object]:
     if args.disable_joint_init:
-        init_result = prepare_basic_seed_init(img_predictor, vol_man, task.seed, args)
-    else:
-        init_result = prepare_seed_init(img_predictor, vol_man, task.seed, args, rng)
-    if init_result is None or (not init_result.is_trustworthy):
-        return None
-    return PreparedSeedTask(task=task, init_result=init_result)
+        return prepare_basic_seed_init(img_predictor, vol_man, task.seed, args)
+    return prepare_seed_init(img_predictor, vol_man, task.seed, args, rng)
 
 
 def run_segmentation():
@@ -167,19 +140,16 @@ def run_segmentation():
     video_predictor = build_sam2_video_predictor(args.sam2_model_cfg, args.sam2_checkpoint, device=device)
     enable_precomputed_feature_cache(video_predictor)
     axis_cache_root = args.axis_sequence_cache_root or os.path.join(args.output_dir, "_axis_sequence_cache")
-
-    axis_sequence_caches: Optional[Dict[int, object]] = None
-    if not args.sequential_axis_cache:
-        axis_sequence_caches = build_all_axis_sequence_caches(
-            volume=vol_man.vol,
-            cache_root=axis_cache_root,
-            image_size=video_predictor.image_size,
-            offload_video_to_cpu=args.vos_offload_video_to_cpu,
-            compute_device=device,
-            video_predictor=video_predictor,
-            enable_feature_cache=args.enable_axis_feature_cache,
-            feature_cache_device=args.feature_cache_device,
-        )
+    axis_sequence_caches = build_all_axis_sequence_caches(
+        volume=vol_man.vol,
+        cache_root=axis_cache_root,
+        image_size=video_predictor.image_size,
+        offload_video_to_cpu=args.vos_offload_video_to_cpu,
+        compute_device=device,
+        video_predictor=video_predictor,
+        enable_feature_cache=args.enable_axis_feature_cache,
+        feature_cache_device=args.feature_cache_device,
+    )
 
     initial_seeds = load_or_build_seeds(args, vol_man)
     if not initial_seeds:
@@ -191,11 +161,14 @@ def run_segmentation():
         return
 
     pending: Deque[SeedTask] = deque([SeedTask(seed=s, is_original=True) for s in initial_seeds])
-    prepared_by_axis = {0: deque(), 1: deque(), 2: deque()}
     seen: Set[Tuple[int, int, int]] = set(initial_seeds)
     global_memory_pool = GlobalMemoryPool()
     covered_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
     trusted_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
+
+    run_tag = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    vos_tmp_root = os.path.join(args.output_dir, f"_tmp_sam2_hybrid_{run_tag}")
+    os.makedirs(vos_tmp_root, exist_ok=True)
 
     segmented_count = 0
     rejected_count = 0
@@ -203,127 +176,101 @@ def run_segmentation():
     promoted_longterm = 0
     trusted_segment_count = 0
     untrusted_segment_count = 0
-    stop_printed = False
 
     pbar = tqdm(total=len(pending), desc="Tracking (SAM2 hybrid)")
-    while (len(pending) > 0) or any(len(q) > 0 for q in prepared_by_axis.values()):
-        while (len(pending) > 0) and (segmented_count < args.max_segmented_seeds):
-            task = pending.popleft()
-            pbar.update(1)
+    while len(pending) > 0:
+        task = pending.popleft()
+        pbar.update(1)
 
-            if seed_should_skip(task, args, vol_man, covered_mask, trusted_mask):
-                continue
-
-            prepared = prepare_seed_task(task, img_predictor, vol_man, args, rng)
-            if prepared is None:
-                rejected_count += 1
-                continue
-
-            segmented_count += 1
-            prepared_by_axis[int(prepared.init_result.axis)].append(prepared)
-
-        if (segmented_count >= args.max_segmented_seeds) and (not stop_printed):
+        if segmented_count >= args.max_segmented_seeds:
             print(f"[STOP] segmented seeds reached max_segmented_seeds={args.max_segmented_seeds}")
-            stop_printed = True
-
-        processed_axis_this_round = False
-        for axis in (0, 1, 2):
-            axis_queue = prepared_by_axis[axis]
-            if len(axis_queue) == 0:
-                continue
-            processed_axis_this_round = True
-
-            if args.sequential_axis_cache:
-                axis_sequence_cache = prepare_axis_sequence_cache(
-                    volume=vol_man.vol,
-                    axis=axis,
-                    cache_root=axis_cache_root,
-                    image_size=video_predictor.image_size,
-                    offload_video_to_cpu=args.vos_offload_video_to_cpu,
-                    compute_device=device,
-                    video_predictor=video_predictor,
-                    enable_feature_cache=args.enable_axis_feature_cache,
-                    feature_cache_device=args.feature_cache_device,
-                )
-            else:
-                axis_sequence_cache = axis_sequence_caches[axis]
-
-            try:
-                while len(axis_queue) > 0:
-                    prepared = axis_queue.popleft()
-                    task = prepared.task
-                    init_result = prepared.init_result
-                    seed = task.seed
-
-                    if seed_should_skip(task, args, vol_man, covered_mask, trusted_mask):
-                        continue
-
-                    track_dim = [0, 1, 2][init_result.axis]
-                    start_idx = seed[track_dim]
-                    max_dist = args.max_track_distance
-                    forward_idxs = list(range(start_idx, min(start_idx + max_dist, vol_man.shape[track_dim])))
-                    backward_idxs = list(range(start_idx, max(start_idx - max_dist, -1), -1))
-
-                    new_fw, stat_fw = track_one_direction_hybrid(
-                        video_predictor=video_predictor,
-                        vol_man=vol_man,
-                        axis=init_result.axis,
-                        box=init_result.box,
-                        idx_list=forward_idxs,
-                        init_masks_by_global_idx=init_result.init_masks_by_global_idx,
-                        offload_video_to_cpu=args.vos_offload_video_to_cpu,
-                        global_memory_pool=global_memory_pool,
-                        axis_sequence_cache=axis_sequence_cache,
-                        seed=seed,
-                        direction="forward",
-                        covered_mask=covered_mask,
-                        trusted_mask=trusted_mask,
-                        start_untrusted_count=task.untrusted_count,
-                        args=args,
-                    )
-                    new_bw, stat_bw = track_one_direction_hybrid(
-                        video_predictor=video_predictor,
-                        vol_man=vol_man,
-                        axis=init_result.axis,
-                        box=init_result.box,
-                        idx_list=backward_idxs,
-                        init_masks_by_global_idx=init_result.init_masks_by_global_idx,
-                        offload_video_to_cpu=args.vos_offload_video_to_cpu,
-                        global_memory_pool=global_memory_pool,
-                        axis_sequence_cache=axis_sequence_cache,
-                        seed=seed,
-                        direction="backward",
-                        covered_mask=covered_mask,
-                        trusted_mask=trusted_mask,
-                        start_untrusted_count=int(stat_fw["final_untrusted_count"]),
-                        args=args,
-                    )
-
-                    promoted_longterm += int(stat_fw["longterm_segments"]) + int(stat_bw["longterm_segments"])
-                    trusted_segment_count += int(stat_fw["trusted_segments"]) + int(stat_bw["trusted_segments"])
-                    untrusted_segment_count += int(stat_fw["untrusted_segments"]) + int(stat_bw["untrusted_segments"])
-
-                    for child in (new_fw + new_bw):
-                        if child.seed in seen:
-                            continue
-                        if args.enable_respawn:
-                            if trusted_mask[child.seed] > 0:
-                                continue
-                        elif vol_man.global_mask[child.seed] > 0:
-                            continue
-                        seen.add(child.seed)
-                        pending.append(child)
-                        respawned_count += 1
-                        pbar.total += 1
-                        pbar.refresh()
-            finally:
-                if args.sequential_axis_cache:
-                    release_axis_sequence_cache(axis_sequence_cache)
-
-        if (not processed_axis_this_round) and (segmented_count >= args.max_segmented_seeds):
             break
 
+        seed = task.seed
+        z, y, x = seed
+        if args.enable_respawn:
+            if task.is_original:
+                if covered_mask[z, y, x] > 0:
+                    continue
+            else:
+                if trusted_mask[z, y, x] > 0:
+                    continue
+        else:
+            if vol_man.global_mask[z, y, x] > 0:
+                continue
+
+        init_result = prepare_init_result(task, img_predictor, vol_man, args, rng)
+        if init_result is None:
+            rejected_count += 1
+            continue
+        if not init_result.is_trustworthy:
+            rejected_count += 1
+            continue
+
+        segmented_count += 1
+        track_dim = [0, 1, 2][init_result.axis]
+        start_idx = seed[track_dim]
+        max_dist = args.max_track_distance
+        forward_idxs = list(range(start_idx, min(start_idx + max_dist, vol_man.shape[track_dim])))
+        backward_idxs = list(range(start_idx, max(start_idx - max_dist, -1), -1))
+
+        new_fw, stat_fw = track_one_direction_hybrid(
+            video_predictor=video_predictor,
+            vol_man=vol_man,
+            axis=init_result.axis,
+            box=init_result.box,
+            idx_list=forward_idxs,
+            init_masks_by_global_idx=init_result.init_masks_by_global_idx,
+            offload_video_to_cpu=args.vos_offload_video_to_cpu,
+            global_memory_pool=global_memory_pool,
+            axis_sequence_cache=axis_sequence_caches[init_result.axis],
+            seed=seed,
+            direction="forward",
+            covered_mask=covered_mask,
+            trusted_mask=trusted_mask,
+            start_untrusted_count=task.untrusted_count,
+            args=args,
+        )
+        new_bw, stat_bw = track_one_direction_hybrid(
+            video_predictor=video_predictor,
+            vol_man=vol_man,
+            axis=init_result.axis,
+            box=init_result.box,
+            idx_list=backward_idxs,
+            init_masks_by_global_idx=init_result.init_masks_by_global_idx,
+            offload_video_to_cpu=args.vos_offload_video_to_cpu,
+            global_memory_pool=global_memory_pool,
+            axis_sequence_cache=axis_sequence_caches[init_result.axis],
+            seed=seed,
+            direction="backward",
+            covered_mask=covered_mask,
+            trusted_mask=trusted_mask,
+            start_untrusted_count=int(stat_fw["final_untrusted_count"]),
+            args=args,
+        )
+
+        promoted_longterm += int(stat_fw["longterm_segments"]) + int(stat_bw["longterm_segments"])
+        trusted_segment_count += int(stat_fw["trusted_segments"]) + int(stat_bw["trusted_segments"])
+        untrusted_segment_count += int(stat_fw["untrusted_segments"]) + int(stat_bw["untrusted_segments"])
+
+        for child in (new_fw + new_bw):
+            if child.seed in seen:
+                continue
+            if args.enable_respawn:
+                if trusted_mask[child.seed] > 0:
+                    continue
+            elif vol_man.global_mask[child.seed] > 0:
+                continue
+            seen.add(child.seed)
+            pending.append(child)
+            respawned_count += 1
+            pbar.total += 1
+            pbar.refresh()
+
     pbar.close()
+
+    if (not args.keep_tmp_vos_frames) and os.path.isdir(vos_tmp_root):
+        shutil.rmtree(vos_tmp_root, ignore_errors=True)
 
     final_path = os.path.join(args.output_dir, args.output_filename)
     flag = (args.need_transpose != "False")
