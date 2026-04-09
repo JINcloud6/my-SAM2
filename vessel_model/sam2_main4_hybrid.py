@@ -50,6 +50,7 @@ def get_args():
     parser.add_argument("--max_track_distance", type=int, default=2000)
     parser.add_argument("--max_init_mask_area", type=int, default=12000)
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
+    parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
 
     parser.add_argument("--enable_seed_judge", action="store_true")

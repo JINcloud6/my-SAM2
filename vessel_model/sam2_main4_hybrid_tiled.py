@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -104,6 +105,24 @@ def load_mask(path: str) -> np.ndarray:
     return (nib.load(path).get_fdata() > 0).astype(np.uint8)
 
 
+def default_init_seg_basename(args) -> str:
+    return f"init_seg_axis{args.axis}_s{args.stride}_t{args.remove_portion}.h5"
+
+
+def shared_auto_init_seg_basename(args) -> str:
+    return (
+        f"init_seg_axis{args.axis}"
+        f"_s{args.stride}"
+        f"_t{args.remove_portion}"
+        f"_g{args.gaussian_kernel}"
+        f"_mb{args.min_bright}.h5"
+    )
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sam2_checkpoint", required=True)
@@ -117,9 +136,20 @@ def get_args():
     parser.add_argument("--need_transpose", default="False")
     parser.add_argument("--cuda_device", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--axis", type=int, default=3)
+    parser.add_argument("--stride", type=int, default=5)
+    parser.add_argument("--gaussian_kernel", type=int, default=5)
+    parser.add_argument("--min_bright", type=int, default=40)
+    parser.add_argument("--remove_portion", type=float, default=0.98)
+    parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--chunk_size", type=int, default=512)
     parser.add_argument("--chunks_subdir", default="chunks")
     parser.add_argument("--merged_subdir", default="merged")
+    parser.add_argument(
+        "--shared_cache_root",
+        default=None,
+        help="Shared cache root for chunk volumes and init_seg files. Defaults to <output_dir>/shared_chunk_cache.",
+    )
     parser.add_argument(
         "--run_prefix",
         default=None,
@@ -157,10 +187,22 @@ def build_child_cmd(
         chunk_output_filename,
         "--dataset_key",
         args.dataset_key,
+        "--axis",
+        str(args.axis),
+        "--stride",
+        str(args.stride),
+        "--gaussian_kernel",
+        str(args.gaussian_kernel),
+        "--min_bright",
+        str(args.min_bright),
+        "--remove_portion",
+        str(args.remove_portion),
         "--cuda_device",
         str(args.cuda_device),
         "--device",
         args.device,
+        "--max_slice_mask_area",
+        str(args.max_slice_mask_area),
         "--need_transpose",
         "False",
     ]
@@ -178,8 +220,11 @@ def main():
     run_prefix = args.run_prefix or (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8])
     chunks_root = os.path.join(args.output_dir, args.chunks_subdir, run_prefix)
     merged_root = os.path.join(args.output_dir, args.merged_subdir, run_prefix)
+    shared_cache_root = args.shared_cache_root or os.path.join(args.output_dir, "shared_chunk_cache")
+    shared_cache_root = os.path.join(shared_cache_root, f"chunk_size_{args.chunk_size}")
     os.makedirs(chunks_root, exist_ok=True)
     os.makedirs(merged_root, exist_ok=True)
+    os.makedirs(shared_cache_root, exist_ok=True)
 
     vol_man = VolumeManager(args.volume_path, key=args.dataset_key)
     full_vol = vol_man.vol
@@ -199,16 +244,19 @@ def main():
     print(f"Chunk size: {args.chunk_size}")
     print(f"Total chunks: {len(chunks)}")
     print(f"Run prefix: {run_prefix}")
+    print(f"Shared cache root: {shared_cache_root}")
 
     processed_chunks = 0
     skipped_chunks = 0
 
     for chunk in chunks:
         chunk_dir = os.path.join(chunks_root, chunk.tag)
-        os.makedirs(chunk_dir, exist_ok=True)
+        shared_chunk_dir = os.path.join(shared_cache_root, chunk.tag)
+        ensure_dir(chunk_dir)
+        ensure_dir(shared_chunk_dir)
 
         chunk_vol = slice_volume(full_vol, chunk)
-        chunk_volume_path = os.path.join(chunk_dir, f"{run_prefix}_{chunk.tag}_volume.nii.gz")
+        shared_volume_path = os.path.join(shared_chunk_dir, f"{chunk.tag}_volume.nii.gz")
         chunk_result_name = f"{run_prefix}_{chunk.tag}_seg.nii.gz"
         chunk_result_path = os.path.join(chunk_dir, chunk_result_name)
 
@@ -226,18 +274,24 @@ def main():
 
         chunk_init_seg_path: Optional[str] = None
         if init_seg is not None:
-            local_init_seg = slice_volume(init_seg, chunk)
-            chunk_init_seg_path = os.path.join(chunk_dir, f"{run_prefix}_{chunk.tag}_init_seg.nii.gz")
-            save_nifti(chunk_init_seg_path, local_init_seg, affine, False)
+            chunk_init_seg_path = os.path.join(shared_chunk_dir, "global_init_seg.nii.gz")
+            if not os.path.exists(chunk_init_seg_path):
+                local_init_seg = slice_volume(init_seg, chunk)
+                save_nifti(chunk_init_seg_path, local_init_seg, affine, False)
+        else:
+            cached_auto_init_seg = os.path.join(shared_chunk_dir, shared_auto_init_seg_basename(args))
+            if os.path.exists(cached_auto_init_seg):
+                chunk_init_seg_path = cached_auto_init_seg
 
         if args.skip_existing_chunks and os.path.exists(chunk_result_path):
             print(f"[SKIP] {chunk.tag}: existing result {chunk_result_path}")
         else:
-            save_nifti(chunk_volume_path, chunk_vol, affine, False)
+            if not os.path.exists(shared_volume_path):
+                save_nifti(shared_volume_path, chunk_vol, affine, False)
             cmd = build_child_cmd(
                 args=args,
                 passthrough_args=passthrough_args,
-                chunk_volume_path=chunk_volume_path,
+                chunk_volume_path=shared_volume_path,
                 chunk_output_dir=chunk_dir,
                 chunk_output_filename=chunk_result_name,
                 chunk_seed_path=chunk_seed_path,
@@ -247,6 +301,11 @@ def main():
             print(" ".join(cmd))
             if not args.dry_run:
                 subprocess.run(cmd, check=True)
+                if init_seg is None:
+                    local_auto_init_seg = os.path.join(chunk_dir, default_init_seg_basename(args))
+                    shared_auto_init_seg = os.path.join(shared_chunk_dir, shared_auto_init_seg_basename(args))
+                    if os.path.exists(local_auto_init_seg) and (not os.path.exists(shared_auto_init_seg)):
+                        shutil.copy2(local_auto_init_seg, shared_auto_init_seg)
 
         if not os.path.exists(chunk_result_path):
             raise FileNotFoundError(f"Chunk result not found: {chunk_result_path}")
@@ -260,10 +319,10 @@ def main():
         merged_mask[chunk.z0:chunk.z1, chunk.y0:chunk.y1, chunk.x0:chunk.x1] |= chunk_mask
         processed_chunks += 1
 
-        if (not args.keep_chunk_volumes) and os.path.exists(chunk_volume_path):
-            os.remove(chunk_volume_path)
-        if (not args.keep_chunk_init_seg) and chunk_init_seg_path and os.path.exists(chunk_init_seg_path):
-            os.remove(chunk_init_seg_path)
+        if (not args.keep_chunk_init_seg) and init_seg is None:
+            local_auto_init_seg = os.path.join(chunk_dir, default_init_seg_basename(args))
+            if os.path.exists(local_auto_init_seg):
+                os.remove(local_auto_init_seg)
 
     merged_filename = f"{run_prefix}_{args.output_filename}" if args.output_filename else f"{run_prefix}_segmentation_merged.nii.gz"
     merged_path = os.path.join(merged_root, merged_filename)

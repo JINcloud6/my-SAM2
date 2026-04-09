@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--max_track_distance", type=int, default=2000)
     parser.add_argument("--max_init_mask_area", type=int, default=12000)
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
+    parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
 
     parser.add_argument("--enable_seed_judge", action="store_true")
@@ -143,6 +144,7 @@ def main():
             "--max_track_distance", str(args.max_track_distance),
             "--max_init_mask_area", str(args.max_init_mask_area),
             "--max_segmented_seeds", str(args.max_segmented_seeds),
+            "--max_slice_mask_area", str(args.max_slice_mask_area),
             "--max_slice_mask_ratio", str(args.max_slice_mask_ratio),
             "--init_half_window", str(args.init_half_window),
             "--top_k", str(args.top_k),

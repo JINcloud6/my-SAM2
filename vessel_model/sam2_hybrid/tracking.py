@@ -257,14 +257,21 @@ def track_one_direction_hybrid(
                         trust_seg_cache = []
                     continue
 
-                slice_area = float(mm.shape[0] * mm.shape[1])
-                if slice_area > 0:
-                    mask_ratio = float(mm.sum()) / slice_area
-                    if mask_ratio > float(args.max_slice_mask_ratio):
-                        terminated_large_mask = True
-                        trust_seg_cache = []
-                        seg_cache = []
-                        break
+                mask_area = int(mm.sum())
+                if mask_area > int(args.max_slice_mask_area):
+                    terminated_large_mask = True
+                    trust_seg_cache = []
+                    seg_cache = []
+                    break
+
+                # slice_area = float(mm.shape[0] * mm.shape[1])
+                # if slice_area > 0:
+                #     mask_ratio = float(mask_area) / slice_area
+                #     if mask_ratio > float(args.max_slice_mask_ratio):
+                #         terminated_large_mask = True
+                #         trust_seg_cache = []
+                #         seg_cache = []
+                #         break
 
                 vol_man.update_global_mask(mm, axis, (gidx, *box[1:]))
                 q = frame_quality_from_logits(mm_logits, mm, prev_mask)
