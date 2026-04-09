@@ -145,6 +145,9 @@ def get_args():
     parser.add_argument("--chunk_size", type=int, default=512)
     parser.add_argument("--chunks_subdir", default="chunks")
     parser.add_argument("--merged_subdir", default="merged")
+    parser.add_argument("--sequential_axis_cache", action="store_true")
+    parser.add_argument("--enable_axis_feature_cache", action="store_true")
+    parser.add_argument("--feature_cache_device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument(
         "--shared_cache_root",
         default=None,
@@ -170,6 +173,7 @@ def build_child_cmd(
     chunk_output_filename: str,
     chunk_seed_path: Optional[str],
     chunk_init_seg_path: Optional[str],
+    axis_sequence_cache_root: str,
 ) -> List[str]:
     cmd = [
         sys.executable,
@@ -185,6 +189,10 @@ def build_child_cmd(
         chunk_output_dir,
         "--output_filename",
         chunk_output_filename,
+        "--axis_sequence_cache_root",
+        axis_sequence_cache_root,
+        "--feature_cache_device",
+        args.feature_cache_device,
         "--dataset_key",
         args.dataset_key,
         "--axis",
@@ -206,6 +214,10 @@ def build_child_cmd(
         "--need_transpose",
         "False",
     ]
+    if args.enable_axis_feature_cache:
+        cmd.append("--enable_axis_feature_cache")
+    if args.sequential_axis_cache:
+        cmd.append("--sequential_axis_cache")
     if chunk_seed_path is not None:
         cmd.extend(["--seed_file", chunk_seed_path])
     if chunk_init_seg_path is not None:
@@ -296,6 +308,7 @@ def main():
                 chunk_output_filename=chunk_result_name,
                 chunk_seed_path=chunk_seed_path,
                 chunk_init_seg_path=chunk_init_seg_path,
+                axis_sequence_cache_root=os.path.join(shared_chunk_dir, "_axis_sequence_cache"),
             )
             print(f"[RUN] {chunk.tag} shape={chunk.shape}")
             print(" ".join(cmd))

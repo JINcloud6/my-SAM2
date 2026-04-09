@@ -1,5 +1,3 @@
-import shutil
-import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -7,7 +5,7 @@ import numpy as np
 import torch
 
 from ..global_memory_pool import GlobalMemoryPool
-from ..sam2_baseline.image_utils import get_slice, to_uint8_rgb, write_jpeg_frames
+from .axis_cache import init_state_from_axis_cache
 from .common import SeedTask, sample_respawn_seeds_from_mask
 from .segment_trust import SegmentFrame, commit_segment
 
@@ -46,21 +44,6 @@ def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
     else:
         stab = mask_iou(prev_mask, mask_bin)
     return 0.7 * conf + 0.3 * stab
-
-
-def build_frames_rgb(vol_man, axis, box, idx_list):
-    frames_rgb = []
-    valid_idxs = []
-    for vidx in idx_list:
-        sl = get_slice(vol_man.vol, axis, vidx, box)
-        if sl.size == 0:
-            break
-        rgb = to_uint8_rgb(sl)
-        if rgb is None:
-            break
-        frames_rgb.append(rgb)
-        valid_idxs.append(vidx)
-    return frames_rgb, valid_idxs
 
 
 def promote_segment_to_longterm(
@@ -117,9 +100,9 @@ def track_one_direction_hybrid(
     box,
     idx_list,
     init_masks_by_global_idx,
-    vos_tmp_root,
     offload_video_to_cpu,
     global_memory_pool: GlobalMemoryPool,
+    axis_sequence_cache,
     seed: Tuple[int, int, int],
     direction: str,
     covered_mask,
@@ -137,12 +120,10 @@ def track_one_direction_hybrid(
     if len(idx_list) == 0:
         return [], empty_stats
 
-    frames_rgb, valid_gidx = build_frames_rgb(vol_man, axis, box, idx_list)
-    if len(frames_rgb) == 0:
+    valid_gidx = [int(vidx) for vidx in idx_list if 0 <= int(vidx) < int(axis_sequence_cache.num_frames)]
+    if len(valid_gidx) == 0:
         return [], empty_stats
-
-    tmp_dir = tempfile.mkdtemp(prefix="sam2_vos_hybrid_", dir=vos_tmp_root)
-    write_jpeg_frames(frames_rgb, tmp_dir)
+    valid_gidx_set = set(valid_gidx)
 
     spawned_tasks: List[SeedTask] = []
     spawned_set: Set[Tuple[int, int, int]] = set()
@@ -153,14 +134,13 @@ def track_one_direction_hybrid(
 
     try:
         with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
-            state = video_predictor.init_state(
-                video_path=tmp_dir,
+            state = init_state_from_axis_cache(
+                video_predictor=video_predictor,
+                seq_cache=axis_sequence_cache,
                 offload_video_to_cpu=offload_video_to_cpu,
                 offload_state_to_cpu=False,
-                async_loading_frames=False,
             )
 
-            idx_to_frame = {gidx: fi for fi, gidx in enumerate(valid_gidx)}
             used = 0
             prev_nonempty_mask = None
             prev_global_idx = None
@@ -170,7 +150,7 @@ def track_one_direction_hybrid(
                 m = init_masks_by_global_idx.get(gidx, None)
                 if m is None or int(m.sum()) == 0:
                     continue
-                fidx = idx_to_frame[gidx]
+                fidx = int(gidx)
                 video_predictor.add_new_mask(state, frame_idx=fidx, obj_id=1, mask=m.astype(bool))
                 vol_man.update_global_mask(m.astype(np.uint8), axis, (gidx, *box[1:]))
                 prev_nonempty_mask = m.astype(np.uint8)
@@ -186,7 +166,7 @@ def track_one_direction_hybrid(
                 m0 = init_masks_by_global_idx.get(g0, None)
                 if m0 is None or int(m0.sum()) == 0:
                     return [], empty_stats
-                video_predictor.add_new_mask(state, frame_idx=0, obj_id=1, mask=m0.astype(bool))
+                video_predictor.add_new_mask(state, frame_idx=int(g0), obj_id=1, mask=m0.astype(bool))
                 vol_man.update_global_mask(m0.astype(np.uint8), axis, (g0, *box[1:]))
                 prev_nonempty_mask = m0.astype(np.uint8)
                 prev_global_idx = g0
@@ -198,7 +178,7 @@ def track_one_direction_hybrid(
             if not getattr(args, "disable_longterm_memory", False):
                 init_mask = prev_nonempty_mask
                 init_radius = float(np.sqrt(float(np.count_nonzero(init_mask)) / np.pi)) if init_mask is not None else 0.0
-                phys_to_local = {int(p): i for i, p in enumerate(valid_gidx)}
+                phys_to_local = {int(p): int(p) for p in valid_gidx}
                 inject_items = global_memory_pool.select_for_injection(
                     axis=axis,
                     current_seed=seed,
@@ -220,7 +200,7 @@ def track_one_direction_hybrid(
             current_untrusted_count = int(start_untrusted_count)
 
             for f_idx, _obj_ids, masks in video_predictor.propagate_in_video(state):
-                if f_idx < 0 or f_idx >= len(valid_gidx):
+                if int(f_idx) not in valid_gidx_set:
                     continue
 
                 mm_logits = masks[0, 0]
@@ -229,7 +209,7 @@ def track_one_direction_hybrid(
                 else:
                     mm = (mm_logits > 0).astype(np.uint8)
 
-                gidx = valid_gidx[f_idx]
+                gidx = int(f_idx)
                 if mm.sum() == 0:
                     if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
                         force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
@@ -381,7 +361,7 @@ def track_one_direction_hybrid(
                     spawned_set.add(task.seed)
                     spawned_tasks.append(task)
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        pass
 
     return spawned_tasks, {
         "longterm_segments": promoted_segments,
