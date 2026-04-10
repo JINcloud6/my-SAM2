@@ -25,6 +25,7 @@ from .sam2_hybrid.axis_cache import build_all_axis_sequence_caches, enable_preco
 from .sam2_hybrid.common import SeedTask, load_or_build_seeds
 from .sam2_hybrid.joint_init import prepare_basic_seed_init, prepare_seed_init
 from .sam2_hybrid.tracking import track_one_direction_hybrid
+from .sam2_hybrid.unified_segment_classifier import save_segment_label_volume
 
 
 def get_args():
@@ -100,6 +101,16 @@ def get_args():
     parser.add_argument("--max_longterm_segments", type=int, default=5)
     parser.add_argument("--working_window", type=int, default=24)
     parser.add_argument("--max_global_inject_per_seed", type=int, default=0)
+    parser.add_argument("--enable_segment_classifier_labels", action="store_true")
+    parser.add_argument("--segment_label_output_filename", default="mousep4_segment_class_labels.nii.gz")
+    parser.add_argument("--segment_classifier_stable_quality_thr", type=float, default=0.80)
+    parser.add_argument("--segment_classifier_stable_iou_thr", type=float, default=0.65)
+    parser.add_argument("--segment_classifier_stable_empty_rate_thr", type=float, default=0.05)
+    parser.add_argument("--segment_classifier_stable_axis_ratio_thr", type=float, default=1.10)
+    parser.add_argument("--segment_classifier_failure_quality_thr", type=float, default=0.55)
+    parser.add_argument("--segment_classifier_failure_iou_thr", type=float, default=0.20)
+    parser.add_argument("--segment_classifier_failure_empty_rate_thr", type=float, default=0.25)
+    parser.add_argument("--segment_classifier_failure_min_frames", type=int, default=3)
 
     parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
     parser.add_argument("--keep_tmp_vos_frames", action="store_true")
@@ -157,6 +168,15 @@ def run_segmentation():
         flag = (args.need_transpose != "False")
         print("No seeds available for SAM2 tracking. Saving empty mask.")
         vol_man.save(final_path, flag)
+        if args.enable_segment_classifier_labels:
+            empty_label_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
+            segment_label_path = os.path.join(args.output_dir, args.segment_label_output_filename)
+            save_segment_label_volume(
+                segment_label_path,
+                empty_label_mask,
+                vol_man.affine,
+                flag,
+            )
         print(f"Done! Saved empty mask to {final_path}")
         return
 
@@ -165,6 +185,9 @@ def run_segmentation():
     global_memory_pool = GlobalMemoryPool()
     covered_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
     trusted_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
+    segment_label_mask = (
+        np.zeros_like(vol_man.vol, dtype=np.uint8) if args.enable_segment_classifier_labels else None
+    )
 
     run_tag = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     vos_tmp_root = os.path.join(args.output_dir, f"_tmp_sam2_hybrid_{run_tag}")
@@ -176,6 +199,9 @@ def run_segmentation():
     promoted_longterm = 0
     trusted_segment_count = 0
     untrusted_segment_count = 0
+    stable_segment_count = 0
+    complex_segment_count = 0
+    failure_segment_count = 0
 
     pbar = tqdm(total=len(pending), desc="Tracking (SAM2 hybrid)")
     while len(pending) > 0:
@@ -228,6 +254,7 @@ def run_segmentation():
             direction="forward",
             covered_mask=covered_mask,
             trusted_mask=trusted_mask,
+            segment_label_mask=segment_label_mask,
             start_untrusted_count=task.untrusted_count,
             args=args,
         )
@@ -245,6 +272,7 @@ def run_segmentation():
             direction="backward",
             covered_mask=covered_mask,
             trusted_mask=trusted_mask,
+            segment_label_mask=segment_label_mask,
             start_untrusted_count=int(stat_fw["final_untrusted_count"]),
             args=args,
         )
@@ -252,6 +280,9 @@ def run_segmentation():
         promoted_longterm += int(stat_fw["longterm_segments"]) + int(stat_bw["longterm_segments"])
         trusted_segment_count += int(stat_fw["trusted_segments"]) + int(stat_bw["trusted_segments"])
         untrusted_segment_count += int(stat_fw["untrusted_segments"]) + int(stat_bw["untrusted_segments"])
+        stable_segment_count += int(stat_fw["stable_segments"]) + int(stat_bw["stable_segments"])
+        complex_segment_count += int(stat_fw["complex_segments"]) + int(stat_bw["complex_segments"])
+        failure_segment_count += int(stat_fw["failure_segments"]) + int(stat_bw["failure_segments"])
 
         for child in (new_fw + new_bw):
             if child.seed in seen:
@@ -275,6 +306,16 @@ def run_segmentation():
     final_path = os.path.join(args.output_dir, args.output_filename)
     flag = (args.need_transpose != "False")
     vol_man.save(final_path, flag)
+    if args.enable_segment_classifier_labels and segment_label_mask is not None:
+        segment_label_path = os.path.join(args.output_dir, args.segment_label_output_filename)
+        saved_label_path = save_segment_label_volume(
+            segment_label_path,
+            segment_label_mask,
+            vol_man.affine,
+            flag,
+        )
+    else:
+        saved_label_path = None
 
     print("=" * 80)
     print(f"Segmented seeds actually run: {segmented_count}")
@@ -284,7 +325,13 @@ def run_segmentation():
     if args.enable_respawn:
         print(f"Trusted segments: {trusted_segment_count}")
         print(f"Untrusted segments: {untrusted_segment_count}")
+    if args.enable_segment_classifier_labels:
+        print(f"Stable segments: {stable_segment_count}")
+        print(f"Complex segments: {complex_segment_count}")
+        print(f"Failure segments: {failure_segment_count}")
     print(f"Done! Saved to {final_path}")
+    if saved_label_path is not None:
+        print(f"Segment class labels saved to {saved_label_path}")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,11 @@ from ..global_memory_pool import GlobalMemoryPool
 from .axis_cache import init_state_from_axis_cache
 from .common import SeedTask, sample_respawn_seeds_from_mask
 from .segment_trust import SegmentFrame, commit_segment
+from .unified_segment_classifier import (
+    ClassifiedSegmentFrame,
+    classify_segment,
+    paint_segment_label_volume,
+)
 
 
 @dataclass
@@ -107,6 +112,7 @@ def track_one_direction_hybrid(
     direction: str,
     covered_mask,
     trusted_mask,
+    segment_label_mask,
     start_untrusted_count: int,
     args,
 ):
@@ -116,6 +122,9 @@ def track_one_direction_hybrid(
         "untrusted_segments": 0,
         "final_untrusted_count": int(start_untrusted_count),
         "terminated_large_mask": False,
+        "stable_segments": 0,
+        "complex_segments": 0,
+        "failure_segments": 0,
     }
     if len(idx_list) == 0:
         return [], empty_stats
@@ -131,6 +140,9 @@ def track_one_direction_hybrid(
     trusted_segments = 0
     untrusted_segments = 0
     terminated_large_mask = False
+    stable_segments = 0
+    complex_segments = 0
+    failure_segments = 0
 
     try:
         with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
@@ -145,6 +157,28 @@ def track_one_direction_hybrid(
             prev_nonempty_mask = None
             prev_global_idx = None
             trust_seg_cache: List[SegmentFrame] = []
+            classified_seg_cache: List[ClassifiedSegmentFrame] = []
+
+            def flush_classified_segment(empty_frame_count: int = 0):
+                nonlocal classified_seg_cache, stable_segments, complex_segments, failure_segments
+                if segment_label_mask is None or len(classified_seg_cache) == 0:
+                    classified_seg_cache = []
+                    return None
+                result = classify_segment(
+                    seg_frames=classified_seg_cache,
+                    track_axis=axis,
+                    empty_frame_count=empty_frame_count,
+                    args=args,
+                )
+                paint_segment_label_volume(segment_label_mask, classified_seg_cache, result.label)
+                if result.label == 1:
+                    stable_segments += 1
+                elif result.label == 2:
+                    complex_segments += 1
+                else:
+                    failure_segments += 1
+                classified_seg_cache = []
+                return result
 
             for gidx in valid_gidx:
                 m = init_masks_by_global_idx.get(gidx, None)
@@ -158,6 +192,16 @@ def track_one_direction_hybrid(
                 if args.enable_respawn:
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(gidx), box=box, mask=m.astype(np.uint8))
+                    )
+                if segment_label_mask is not None:
+                    classified_seg_cache.append(
+                        ClassifiedSegmentFrame(
+                            axis=axis,
+                            global_frame_idx=int(gidx),
+                            box=box,
+                            mask=m.astype(np.uint8),
+                            quality=None,
+                        )
                     )
                 used += 1
 
@@ -173,6 +217,16 @@ def track_one_direction_hybrid(
                 if args.enable_respawn:
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(g0), box=box, mask=m0.astype(np.uint8))
+                    )
+                if segment_label_mask is not None:
+                    classified_seg_cache.append(
+                        ClassifiedSegmentFrame(
+                            axis=axis,
+                            global_frame_idx=int(g0),
+                            box=box,
+                            mask=m0.astype(np.uint8),
+                            quality=None,
+                        )
                     )
 
             if not getattr(args, "disable_longterm_memory", False):
@@ -211,6 +265,7 @@ def track_one_direction_hybrid(
 
                 gidx = int(f_idx)
                 if mm.sum() == 0:
+                    flush_classified_segment(empty_frame_count=1)
                     if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
                         force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                         new_seeds, decision = commit_segment(
@@ -240,6 +295,7 @@ def track_one_direction_hybrid(
                 mask_area = int(mm.sum())
                 if mask_area > int(args.max_slice_mask_area):
                     terminated_large_mask = True
+                    flush_classified_segment(empty_frame_count=0)
                     trust_seg_cache = []
                     seg_cache = []
                     break
@@ -270,6 +326,16 @@ def track_one_direction_hybrid(
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(gidx), box=box, mask=mm.astype(np.uint8))
                     )
+                if segment_label_mask is not None:
+                    classified_seg_cache.append(
+                        ClassifiedSegmentFrame(
+                            axis=axis,
+                            global_frame_idx=int(gidx),
+                            box=box,
+                            mask=mm.astype(np.uint8),
+                            quality=float(q),
+                        )
+                    )
 
                 if not getattr(args, "disable_longterm_memory", False):
                     min_keep = max(0, f_idx - args.working_window)
@@ -296,6 +362,9 @@ def track_one_direction_hybrid(
                         if len(longterm_bank) > before:
                             promoted_segments += 1
                         seg_cache = []
+
+                if segment_label_mask is not None and len(classified_seg_cache) >= args.segment_len:
+                    flush_classified_segment(empty_frame_count=0)
 
                 if args.enable_respawn and len(trust_seg_cache) >= args.segment_len:
                     force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
@@ -337,6 +406,7 @@ def track_one_direction_hybrid(
                 )
                 if len(longterm_bank) > before:
                     promoted_segments += 1
+            flush_classified_segment(empty_frame_count=0)
             if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
                 force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                 new_seeds, decision = commit_segment(
@@ -369,4 +439,7 @@ def track_one_direction_hybrid(
         "untrusted_segments": untrusted_segments,
         "final_untrusted_count": int(start_untrusted_count) if not args.enable_respawn else current_untrusted_count,
         "terminated_large_mask": terminated_large_mask,
+        "stable_segments": stable_segments,
+        "complex_segments": complex_segments,
+        "failure_segments": failure_segments,
     }
