@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
@@ -30,6 +30,8 @@ class SegmentMetrics:
     dominant_axis: int
     axis_ratio: float
     spans: Tuple[int, int, int]
+    tube_score: float
+    pca_eigenvalues: Tuple[float, float, float]
 
 
 @dataclass
@@ -37,6 +39,9 @@ class SegmentClassResult:
     category: str
     label: int
     metrics: SegmentMetrics
+    stable_fail_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    stable_fail_details: Tuple[str, ...] = field(default_factory=tuple)
+    failure_reasons: Tuple[str, ...] = field(default_factory=tuple)
 
 
 def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -96,6 +101,8 @@ def compute_segment_metrics(
         spans = (0, 0, 0)
         dominant_axis = -1
         axis_ratio = 0.0
+        tube_score = 0.0
+        pca_eigenvalues = (0.0, 0.0, 0.0)
     else:
         coords = np.concatenate(coords_acc, axis=0)
         min_xyz = coords.min(axis=0)
@@ -106,6 +113,16 @@ def compute_segment_metrics(
         other_axes = [a for a in (0, 1, 2) if a != track_axis]
         second_extent = max(float(spans_arr[other_axes[0]]), float(spans_arr[other_axes[1]]))
         axis_ratio = float(spans_arr[track_axis]) / max(second_extent, EPS)
+        if coords.shape[0] >= 3:
+            centered = coords.astype(np.float32) - coords.astype(np.float32).mean(axis=0, keepdims=True)
+            cov = np.matmul(centered.T, centered) / max(float(coords.shape[0] - 1), 1.0)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.sort(np.clip(eigvals.astype(np.float64), a_min=0.0, a_max=None))[::-1]
+            tube_score = float(eigvals[0]) / float(eigvals[1] + eigvals[2] + EPS)
+            pca_eigenvalues = (float(eigvals[0]), float(eigvals[1]), float(eigvals[2]))
+        else:
+            tube_score = 0.0
+            pca_eigenvalues = (0.0, 0.0, 0.0)
 
     return SegmentMetrics(
         avg_quality=avg_quality,
@@ -116,6 +133,8 @@ def compute_segment_metrics(
         dominant_axis=int(dominant_axis),
         axis_ratio=float(axis_ratio),
         spans=spans,
+        tube_score=float(tube_score),
+        pca_eigenvalues=pca_eigenvalues,
     )
 
 
@@ -123,6 +142,8 @@ def classify_segment(
     seg_frames: List[ClassifiedSegmentFrame],
     track_axis: int,
     empty_frame_count: int,
+    terminated_by_boundary: bool,
+    termination_reason: str,
     args,
 ) -> SegmentClassResult:
     metrics = compute_segment_metrics(
@@ -131,27 +152,98 @@ def classify_segment(
         empty_frame_count=empty_frame_count,
     )
 
-    is_failure = (
-        metrics.nonempty_frames <= 0
-        or metrics.total_frames < int(args.segment_classifier_failure_min_frames)
-        or metrics.avg_quality < float(args.segment_classifier_failure_quality_thr)
-        or metrics.avg_adj_iou < float(args.segment_classifier_failure_iou_thr)
-        or metrics.empty_rate > float(args.segment_classifier_failure_empty_rate_thr)
+    require_dominant_axis_match = not bool(
+        getattr(args, "disable_segment_classifier_dominant_axis_check", False)
     )
-    if is_failure:
-        return SegmentClassResult(category="failure", label=FAILURE_LABEL, metrics=metrics)
 
-    is_stable = (
-        metrics.avg_quality >= float(args.segment_classifier_stable_quality_thr)
-        and metrics.avg_adj_iou >= float(args.segment_classifier_stable_iou_thr)
-        and metrics.empty_rate <= float(args.segment_classifier_stable_empty_rate_thr)
-        and metrics.dominant_axis == int(track_axis)
-        and metrics.axis_ratio >= float(args.segment_classifier_stable_axis_ratio_thr)
-    )
-    if is_stable:
+    failure_reasons: List[str] = []
+    if metrics.nonempty_frames <= 0:
+        failure_reasons.append("no_nonempty_frames")
+    if metrics.total_frames < int(args.segment_classifier_failure_min_frames):
+        failure_reasons.append("too_short")
+    if metrics.avg_quality < float(args.segment_classifier_failure_quality_thr):
+        failure_reasons.append("low_quality")
+    if metrics.avg_adj_iou < float(args.segment_classifier_failure_iou_thr):
+        failure_reasons.append("low_adj_iou")
+    if metrics.empty_rate > float(args.segment_classifier_failure_empty_rate_thr):
+        failure_reasons.append("high_empty_rate")
+    if len(failure_reasons) > 0:
+        return SegmentClassResult(
+            category="failure",
+            label=FAILURE_LABEL,
+            metrics=metrics,
+            failure_reasons=tuple(failure_reasons),
+        )
+
+    if terminated_by_boundary and metrics.total_frames <= int(
+        args.segment_classifier_boundary_tail_max_frames
+    ):
         return SegmentClassResult(category="stable", label=STABLE_LABEL, metrics=metrics)
 
-    return SegmentClassResult(category="complex", label=COMPLEX_LABEL, metrics=metrics)
+    stable_fail_reasons: List[str] = []
+    stable_fail_details: List[str] = []
+    if metrics.avg_quality < float(args.segment_classifier_stable_quality_thr):
+        stable_fail_reasons.append("stable_quality")
+        stable_fail_details.append(
+            f"stable_quality: value={metrics.avg_quality:.4f} < thr={float(args.segment_classifier_stable_quality_thr):.4f}"
+        )
+    if metrics.avg_adj_iou < float(args.segment_classifier_stable_iou_thr):
+        stable_fail_reasons.append("stable_adj_iou")
+        stable_fail_details.append(
+            f"stable_adj_iou: value={metrics.avg_adj_iou:.4f} < thr={float(args.segment_classifier_stable_iou_thr):.4f}"
+        )
+    if metrics.empty_rate > float(args.segment_classifier_stable_empty_rate_thr):
+        stable_fail_reasons.append("stable_empty_rate")
+        stable_fail_details.append(
+            f"stable_empty_rate: value={metrics.empty_rate:.4f} > thr={float(args.segment_classifier_stable_empty_rate_thr):.4f}"
+        )
+    if require_dominant_axis_match and metrics.dominant_axis != int(track_axis):
+        stable_fail_reasons.append("stable_dominant_axis")
+        stable_fail_details.append(
+            f"stable_dominant_axis: dominant_axis={metrics.dominant_axis} != track_axis={int(track_axis)}"
+        )
+    if metrics.axis_ratio < float(args.segment_classifier_stable_axis_ratio_thr):
+        stable_fail_reasons.append("stable_axis_ratio")
+        stable_fail_details.append(
+            f"stable_axis_ratio: value={metrics.axis_ratio:.4f} < thr={float(args.segment_classifier_stable_axis_ratio_thr):.4f}"
+        )
+    if len(stable_fail_reasons) == 0:
+        return SegmentClassResult(category="stable", label=STABLE_LABEL, metrics=metrics)
+
+    if metrics.tube_score >= float(args.segment_classifier_complex_tube_score_thr):
+        return SegmentClassResult(category="stable", label=STABLE_LABEL, metrics=metrics)
+
+    stable_fail_reasons.append("stable_tube_score")
+    stable_fail_details.append(
+        f"stable_tube_score: value={metrics.tube_score:.4f} < thr={float(args.segment_classifier_complex_tube_score_thr):.4f}"
+    )
+    if terminated_by_boundary:
+        stable_fail_details.append(
+            f"termination_reason: reached_boundary but total_frames={metrics.total_frames} > tail_thr={int(args.segment_classifier_boundary_tail_max_frames)}"
+        )
+    else:
+        stable_fail_details.append(f"termination_reason: {termination_reason}")
+
+    return SegmentClassResult(
+        category="complex",
+        label=COMPLEX_LABEL,
+        metrics=metrics,
+        stable_fail_reasons=tuple(stable_fail_reasons),
+        stable_fail_details=tuple(stable_fail_details),
+    )
+
+
+def update_reason_counts(
+    reason_counts: Dict[str, int],
+    combo_counts: Dict[str, int],
+    reasons: Tuple[str, ...],
+) -> None:
+    if len(reasons) == 0:
+        return
+    for reason in reasons:
+        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+    combo_key = " + ".join(reasons)
+    combo_counts[combo_key] = int(combo_counts.get(combo_key, 0)) + 1
 
 
 def paint_segment_label_volume(

@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections import deque
-from typing import Deque, Optional, Set, Tuple
+from typing import Deque, Dict, Optional, Set, Tuple
 
 import hydra
 import numpy as np
@@ -85,6 +85,12 @@ def get_args():
     parser.add_argument("--enable_respawn", action="store_true")
     parser.add_argument("--disable_longterm_memory", action="store_true")
     parser.add_argument("--segment_len", type=int, default=15)
+    parser.add_argument(
+        "--segment_len_diameter_multiplier",
+        type=float,
+        default=0.0,
+        help="If > 0, use ceil(first-frame mask diameter * this multiplier) as the current segment decision length; otherwise use fixed --segment_len.",
+    )
     parser.add_argument("--min_segment_frames", type=int, default=5)
     parser.add_argument("--axis_ratio_thr", type=float, default=1.1)
     parser.add_argument("--segment_respawn_num_seeds", type=int, default=4)
@@ -107,10 +113,32 @@ def get_args():
     parser.add_argument("--segment_classifier_stable_iou_thr", type=float, default=0.65)
     parser.add_argument("--segment_classifier_stable_empty_rate_thr", type=float, default=0.05)
     parser.add_argument("--segment_classifier_stable_axis_ratio_thr", type=float, default=1.10)
+    parser.add_argument(
+        "--segment_classifier_boundary_tail_max_frames",
+        type=int,
+        default=6,
+        help="If a non-failure segment ends at the dataset boundary within this many frames, classify it as stable.",
+    )
+    parser.add_argument(
+        "--segment_classifier_complex_tube_score_thr",
+        type=float,
+        default=2.5,
+        help="Rescue an initially complex segment to stable if its PCA tube score lambda1/(lambda2+lambda3+eps) reaches this value.",
+    )
+    parser.add_argument(
+        "--disable_segment_classifier_dominant_axis_check",
+        action="store_true",
+        help="Do not require dominant_axis == track_axis when deciding whether a segment is stable.",
+    )
     parser.add_argument("--segment_classifier_failure_quality_thr", type=float, default=0.55)
     parser.add_argument("--segment_classifier_failure_iou_thr", type=float, default=0.20)
     parser.add_argument("--segment_classifier_failure_empty_rate_thr", type=float, default=0.25)
     parser.add_argument("--segment_classifier_failure_min_frames", type=int, default=3)
+    parser.add_argument(
+        "--print_segment_classifier_details",
+        action="store_true",
+        help="Print per-segment stable rule violations with actual metric values and thresholds.",
+    )
 
     parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
     parser.add_argument("--keep_tmp_vos_frames", action="store_true")
@@ -202,6 +230,8 @@ def run_segmentation():
     stable_segment_count = 0
     complex_segment_count = 0
     failure_segment_count = 0
+    complex_reason_counts: Dict[str, int] = {}
+    complex_reason_combo_counts: Dict[str, int] = {}
 
     pbar = tqdm(total=len(pending), desc="Tracking (SAM2 hybrid)")
     while len(pending) > 0:
@@ -283,6 +313,14 @@ def run_segmentation():
         stable_segment_count += int(stat_fw["stable_segments"]) + int(stat_bw["stable_segments"])
         complex_segment_count += int(stat_fw["complex_segments"]) + int(stat_bw["complex_segments"])
         failure_segment_count += int(stat_fw["failure_segments"]) + int(stat_bw["failure_segments"])
+        for key, value in stat_fw["complex_reason_counts"].items():
+            complex_reason_counts[key] = int(complex_reason_counts.get(key, 0)) + int(value)
+        for key, value in stat_bw["complex_reason_counts"].items():
+            complex_reason_counts[key] = int(complex_reason_counts.get(key, 0)) + int(value)
+        for key, value in stat_fw["complex_reason_combo_counts"].items():
+            complex_reason_combo_counts[key] = int(complex_reason_combo_counts.get(key, 0)) + int(value)
+        for key, value in stat_bw["complex_reason_combo_counts"].items():
+            complex_reason_combo_counts[key] = int(complex_reason_combo_counts.get(key, 0)) + int(value)
 
         for child in (new_fw + new_bw):
             if child.seed in seen:
@@ -329,6 +367,13 @@ def run_segmentation():
         print(f"Stable segments: {stable_segment_count}")
         print(f"Complex segments: {complex_segment_count}")
         print(f"Failure segments: {failure_segment_count}")
+        if complex_segment_count > 0:
+            print("Complex segment reasons:")
+            for key, value in sorted(complex_reason_counts.items(), key=lambda x: (-x[1], x[0])):
+                print(f"  {key}: {value}")
+            print("Complex segment reason combos:")
+            for key, value in sorted(complex_reason_combo_counts.items(), key=lambda x: (-x[1], x[0])):
+                print(f"  {key}: {value}")
     print(f"Done! Saved to {final_path}")
     if saved_label_path is not None:
         print(f"Segment class labels saved to {saved_label_path}")

@@ -208,23 +208,20 @@ def build_init_masks_dict(idxs, masks):
     return {idxs[t]: masks[t].astype(np.uint8) for t in range(len(idxs))}
 
 
-def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
-    crops = vol_man.get_triplane_crops(seed)
-    autocast_device = str(vol_man.device) if hasattr(vol_man, "device") else args.device
-    best_axis, best_mask = select_best_axis_seed_mask(
-        img_predictor, crops, seed, args.max_init_mask_area, autocast_device
-    )
-    if best_axis == -1 or best_mask is None or int(best_mask.sum()) == 0:
-        return None
-    if int(best_mask.sum()) > args.max_init_mask_area:
-        return None
-
-    _, box = crops[best_axis]
-    idxs, layers = build_layers_for_seed(img_predictor, vol_man, seed, best_axis, box, args, base_rng)
+def evaluate_axis_joint_init(img_predictor, vol_man, seed, axis, box, args, axis_rng) -> Optional[JointInitResult]:
+    idxs, layers = build_layers_for_seed(img_predictor, vol_man, seed, axis, box, args, axis_rng)
     if len(layers) == 0:
         return None
+
     baseline = dp_best_path_with_energy(layers, args)
     baseline_masks = path_masks_from_layers(layers, baseline["path"])
+    center_local_idx = min(max(seed[axis] - idxs[0], 0), len(baseline_masks) - 1)
+    center_mask = baseline_masks[center_local_idx] if len(baseline_masks) > 0 else None
+    if center_mask is None or int(center_mask.sum()) == 0:
+        return None
+    if int(center_mask.sum()) > args.max_init_mask_area:
+        return None
+
     avg_area = float(np.mean([int(m.sum()) for m in baseline_masks])) if len(baseline_masks) > 0 else 0.0
     if avg_area > args.max_joint_avg_area:
         return None
@@ -237,8 +234,8 @@ def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[
     robust_energies = []
     robust_path_ious = []
     for _ in range(args.robust_trials):
-        trial_rng = np.random.default_rng(int(base_rng.integers(0, 2**31 - 1)))
-        _, layers_t = build_layers_for_seed(img_predictor, vol_man, seed, best_axis, box, args, trial_rng)
+        trial_rng = np.random.default_rng(int(axis_rng.integers(0, 2**31 - 1)))
+        _, layers_t = build_layers_for_seed(img_predictor, vol_man, seed, axis, box, args, trial_rng)
         trial = dp_best_path_with_energy(layers_t, args)
         robust_energies.append(float(trial["best_energy"]))
         trial_masks = path_masks_from_layers(layers_t, trial["path"])
@@ -262,7 +259,7 @@ def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[
 
     return JointInitResult(
         seed=seed,
-        axis=best_axis,
+        axis=axis,
         box=box,
         init_masks_by_global_idx=build_init_masks_dict(idxs, baseline_masks),
         best_energy=float(baseline["best_energy"]),
@@ -273,6 +270,34 @@ def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[
         avg_area=avg_area,
         is_trustworthy=bool(is_trustworthy),
     )
+
+
+def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
+    crops = vol_man.get_triplane_crops(seed)
+    axis_results: List[JointInitResult] = []
+
+    for axis in [0, 1, 2]:
+        _, box = crops[axis]
+        axis_seed = int(base_rng.integers(0, 2**31 - 1))
+        axis_rng = np.random.default_rng(axis_seed)
+        axis_result = evaluate_axis_joint_init(
+            img_predictor=img_predictor,
+            vol_man=vol_man,
+            seed=seed,
+            axis=axis,
+            box=box,
+            args=args,
+            axis_rng=axis_rng,
+        )
+        if axis_result is None:
+            continue
+        axis_results.append(axis_result)
+
+    if len(axis_results) == 0:
+        return None
+
+    axis_results.sort(key=lambda x: (x.best_energy, x.avg_area, x.axis))
+    return axis_results[0]
 
 
 def prepare_basic_seed_init(img_predictor, vol_man, seed, args) -> Optional[JointInitResult]:

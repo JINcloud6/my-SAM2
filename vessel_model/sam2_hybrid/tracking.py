@@ -12,6 +12,7 @@ from .unified_segment_classifier import (
     ClassifiedSegmentFrame,
     classify_segment,
     paint_segment_label_volume,
+    update_reason_counts,
 )
 
 
@@ -49,6 +50,20 @@ def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
     else:
         stab = mask_iou(prev_mask, mask_bin)
     return 0.7 * conf + 0.3 * stab
+
+
+def segment_len_target_from_first_mask(mask: np.ndarray, args) -> int:
+    multiplier = float(getattr(args, "segment_len_diameter_multiplier", 0.0))
+    if multiplier <= 0.0:
+        return int(args.segment_len)
+
+    area = int(np.count_nonzero(mask))
+    if area <= 0:
+        return int(args.segment_len)
+
+    radius = float(np.sqrt(float(area) / np.pi))
+    diameter = 2.0 * radius
+    return max(1, int(np.ceil(diameter * multiplier)))
 
 
 def promote_segment_to_longterm(
@@ -125,6 +140,8 @@ def track_one_direction_hybrid(
         "stable_segments": 0,
         "complex_segments": 0,
         "failure_segments": 0,
+        "complex_reason_counts": {},
+        "complex_reason_combo_counts": {},
     }
     if len(idx_list) == 0:
         return [], empty_stats
@@ -143,6 +160,8 @@ def track_one_direction_hybrid(
     stable_segments = 0
     complex_segments = 0
     failure_segments = 0
+    complex_reason_counts: Dict[str, int] = {}
+    complex_reason_combo_counts: Dict[str, int] = {}
 
     try:
         with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
@@ -158,25 +177,68 @@ def track_one_direction_hybrid(
             prev_global_idx = None
             trust_seg_cache: List[SegmentFrame] = []
             classified_seg_cache: List[ClassifiedSegmentFrame] = []
+            current_segment_len_target: Optional[int] = None
+            enable_segment_classification = (
+                (segment_label_mask is not None) or getattr(args, "print_segment_classifier_details", False)
+            )
+
+            def ensure_segment_len_target(mask: np.ndarray) -> int:
+                nonlocal current_segment_len_target
+                if current_segment_len_target is None:
+                    current_segment_len_target = segment_len_target_from_first_mask(mask, args)
+                return int(current_segment_len_target)
+
+            def reset_segment_len_target() -> None:
+                nonlocal current_segment_len_target
+                current_segment_len_target = None
 
             def flush_classified_segment(empty_frame_count: int = 0):
                 nonlocal classified_seg_cache, stable_segments, complex_segments, failure_segments
-                if segment_label_mask is None or len(classified_seg_cache) == 0:
+                return _flush_classified_segment(
+                    empty_frame_count=empty_frame_count,
+                    terminated_by_boundary=False,
+                    termination_reason="normal",
+                )
+
+            def _flush_classified_segment(
+                empty_frame_count: int = 0,
+                terminated_by_boundary: bool = False,
+                termination_reason: str = "normal",
+            ):
+                nonlocal classified_seg_cache, stable_segments, complex_segments, failure_segments
+                if len(classified_seg_cache) == 0:
                     classified_seg_cache = []
                     return None
+                seg_start = int(classified_seg_cache[0].global_frame_idx)
+                seg_end = int(classified_seg_cache[-1].global_frame_idx)
                 result = classify_segment(
                     seg_frames=classified_seg_cache,
                     track_axis=axis,
                     empty_frame_count=empty_frame_count,
+                    terminated_by_boundary=terminated_by_boundary,
+                    termination_reason=termination_reason,
                     args=args,
                 )
-                paint_segment_label_volume(segment_label_mask, classified_seg_cache, result.label)
+                if segment_label_mask is not None:
+                    paint_segment_label_volume(segment_label_mask, classified_seg_cache, result.label)
                 if result.label == 1:
                     stable_segments += 1
                 elif result.label == 2:
                     complex_segments += 1
+                    update_reason_counts(
+                        complex_reason_counts,
+                        complex_reason_combo_counts,
+                        result.stable_fail_reasons,
+                    )
                 else:
                     failure_segments += 1
+                if getattr(args, "print_segment_classifier_details", False) and len(result.stable_fail_details) > 0:
+                    print(
+                        f"[SegmentClassifier] seed={seed} dir={direction} axis={axis} "
+                        f"frames={seg_start}->{seg_end} category={result.category}"
+                    )
+                    for detail in result.stable_fail_details:
+                        print(f"  - {detail}")
                 classified_seg_cache = []
                 return result
 
@@ -184,6 +246,7 @@ def track_one_direction_hybrid(
                 m = init_masks_by_global_idx.get(gidx, None)
                 if m is None or int(m.sum()) == 0:
                     continue
+                ensure_segment_len_target(m.astype(np.uint8))
                 fidx = int(gidx)
                 video_predictor.add_new_mask(state, frame_idx=fidx, obj_id=1, mask=m.astype(bool))
                 vol_man.update_global_mask(m.astype(np.uint8), axis, (gidx, *box[1:]))
@@ -193,7 +256,7 @@ def track_one_direction_hybrid(
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(gidx), box=box, mask=m.astype(np.uint8))
                     )
-                if segment_label_mask is not None:
+                if enable_segment_classification:
                     classified_seg_cache.append(
                         ClassifiedSegmentFrame(
                             axis=axis,
@@ -210,6 +273,7 @@ def track_one_direction_hybrid(
                 m0 = init_masks_by_global_idx.get(g0, None)
                 if m0 is None or int(m0.sum()) == 0:
                     return [], empty_stats
+                ensure_segment_len_target(m0.astype(np.uint8))
                 video_predictor.add_new_mask(state, frame_idx=int(g0), obj_id=1, mask=m0.astype(bool))
                 vol_man.update_global_mask(m0.astype(np.uint8), axis, (g0, *box[1:]))
                 prev_nonempty_mask = m0.astype(np.uint8)
@@ -218,7 +282,7 @@ def track_one_direction_hybrid(
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(g0), box=box, mask=m0.astype(np.uint8))
                     )
-                if segment_label_mask is not None:
+                if enable_segment_classification:
                     classified_seg_cache.append(
                         ClassifiedSegmentFrame(
                             axis=axis,
@@ -265,7 +329,11 @@ def track_one_direction_hybrid(
 
                 gidx = int(f_idx)
                 if mm.sum() == 0:
-                    flush_classified_segment(empty_frame_count=1)
+                    _flush_classified_segment(
+                        empty_frame_count=1,
+                        terminated_by_boundary=False,
+                        termination_reason="empty_frame",
+                    )
                     if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
                         force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                         new_seeds, decision = commit_segment(
@@ -290,14 +358,20 @@ def track_one_direction_hybrid(
                             spawned_set.add(task.seed)
                             spawned_tasks.append(task)
                         trust_seg_cache = []
+                    reset_segment_len_target()
                     continue
 
                 mask_area = int(mm.sum())
                 if mask_area > int(args.max_slice_mask_area):
                     terminated_large_mask = True
-                    flush_classified_segment(empty_frame_count=0)
+                    _flush_classified_segment(
+                        empty_frame_count=0,
+                        terminated_by_boundary=False,
+                        termination_reason="large_mask",
+                    )
                     trust_seg_cache = []
                     seg_cache = []
+                    reset_segment_len_target()
                     break
 
                 # slice_area = float(mm.shape[0] * mm.shape[1])
@@ -322,11 +396,12 @@ def track_one_direction_hybrid(
                 prev_mask = mm
                 prev_nonempty_mask = mm
                 prev_global_idx = gidx
+                current_target = ensure_segment_len_target(mm.astype(np.uint8))
                 if args.enable_respawn:
                     trust_seg_cache.append(
                         SegmentFrame(axis=axis, global_frame_idx=int(gidx), box=box, mask=mm.astype(np.uint8))
                     )
-                if segment_label_mask is not None:
+                if enable_segment_classification:
                     classified_seg_cache.append(
                         ClassifiedSegmentFrame(
                             axis=axis,
@@ -363,10 +438,15 @@ def track_one_direction_hybrid(
                             promoted_segments += 1
                         seg_cache = []
 
-                if segment_label_mask is not None and len(classified_seg_cache) >= args.segment_len:
-                    flush_classified_segment(empty_frame_count=0)
+                if enable_segment_classification and len(classified_seg_cache) >= current_target:
+                    _flush_classified_segment(
+                        empty_frame_count=0,
+                        terminated_by_boundary=False,
+                        termination_reason="segment_len",
+                    )
+                    reset_segment_len_target()
 
-                if args.enable_respawn and len(trust_seg_cache) >= args.segment_len:
+                if args.enable_respawn and len(trust_seg_cache) >= current_target:
                     force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                     new_seeds, decision = commit_segment(
                         seg_frames=trust_seg_cache,
@@ -390,6 +470,7 @@ def track_one_direction_hybrid(
                         spawned_set.add(task.seed)
                         spawned_tasks.append(task)
                     trust_seg_cache = []
+                    reset_segment_len_target()
 
             if (not getattr(args, "disable_longterm_memory", False)) and len(seg_cache) > 0:
                 before = len(longterm_bank)
@@ -406,7 +487,19 @@ def track_one_direction_hybrid(
                 )
                 if len(longterm_bank) > before:
                     promoted_segments += 1
-            flush_classified_segment(empty_frame_count=0)
+            reached_dataset_boundary = False
+            if len(classified_seg_cache) > 0:
+                last_gidx = int(classified_seg_cache[-1].global_frame_idx)
+                if direction == "forward":
+                    reached_dataset_boundary = last_gidx >= int(axis_sequence_cache.num_frames) - 1
+                else:
+                    reached_dataset_boundary = last_gidx <= 0
+            _flush_classified_segment(
+                empty_frame_count=0,
+                terminated_by_boundary=reached_dataset_boundary,
+                termination_reason="dataset_boundary" if reached_dataset_boundary else "direction_end",
+            )
+            reset_segment_len_target()
             if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
                 force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                 new_seeds, decision = commit_segment(
@@ -442,4 +535,6 @@ def track_one_direction_hybrid(
         "stable_segments": stable_segments,
         "complex_segments": complex_segments,
         "failure_segments": failure_segments,
+        "complex_reason_counts": complex_reason_counts,
+        "complex_reason_combo_counts": complex_reason_combo_counts,
     }
