@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
+from skimage.morphology import skeletonize
 
 from .common import SeedTask
 
@@ -155,8 +156,154 @@ def sample_respawn_seeds_from_segment(seg_frames: List[SegmentFrame], trusted_ma
     return [tuple(int(v) for v in candidate_coords[idx]) for idx in selected_indices]
 
 
-def commit_segment(seg_frames: List[SegmentFrame], covered_mask: np.ndarray, trusted_mask: np.ndarray, track_axis: int,
-                   args, force_trusted: bool = False):
+def _count_skeleton_neighbors(skeleton: np.ndarray, coord_local: np.ndarray) -> int:
+    z, y, x = [int(v) for v in coord_local.tolist()]
+    z0 = max(0, z - 1)
+    y0 = max(0, y - 1)
+    x0 = max(0, x - 1)
+    z1 = min(skeleton.shape[0], z + 2)
+    y1 = min(skeleton.shape[1], y + 2)
+    x1 = min(skeleton.shape[2], x + 2)
+    return int(np.count_nonzero(skeleton[z0:z1, y0:y1, x0:x1])) - 1
+
+
+def _estimate_endpoint_outward_direction(endpoint_local: np.ndarray, skeleton_coords_local: np.ndarray) -> Optional[np.ndarray]:
+    # Direction is estimated from nearby skeleton points on the inside of the branch.
+    # We then flip that inward tangent so the proposed seed extends outwards from the endpoint.
+    deltas = skeleton_coords_local.astype(np.float32) - endpoint_local.astype(np.float32)
+    dist2 = np.sum(deltas * deltas, axis=1)
+    valid = dist2 > 0
+    if not np.any(valid):
+        return None
+
+    valid_deltas = deltas[valid]
+    valid_dist2 = dist2[valid]
+    order = np.argsort(valid_dist2)
+    inward_vec = valid_deltas[order[: min(6, len(order))]].mean(axis=0)
+    norm = float(np.linalg.norm(inward_vec))
+    if norm <= EPS:
+        inward_vec = valid_deltas[order[0]]
+        norm = float(np.linalg.norm(inward_vec))
+        if norm <= EPS:
+            return None
+    return (-inward_vec / norm).astype(np.float32)
+
+
+def propose_skeleton_respawn_seeds(
+    seg_frames: List[SegmentFrame],
+    trusted_mask: np.ndarray,
+    skeleton_respawn_offset: float,
+    max_skeleton_respawn_seeds: int,
+    min_seed_distance: float,
+) -> List[Tuple[int, int, int]]:
+    if len(seg_frames) == 0 or max_skeleton_respawn_seeds <= 0:
+        return []
+
+    coords_acc = []
+    for item in seg_frames:
+        append_segment_voxels(coords_acc, item)
+    if len(coords_acc) == 0:
+        return []
+
+    segment_coords = np.concatenate(coords_acc, axis=0)
+    segment_coords = np.unique(segment_coords, axis=0)
+
+    # Rebuild the segment as a local 3D binary mask so skeletonization only touches a tight bbox.
+    min_xyz = segment_coords.min(axis=0)
+    max_xyz = segment_coords.max(axis=0)
+    local_shape = (max_xyz - min_xyz + 1).astype(np.int32)
+    local_mask = np.zeros(tuple(int(v) for v in local_shape.tolist()), dtype=bool)
+
+    # Coordinate mapping:
+    #   global voxel = local voxel + min_xyz
+    #   local voxel = global voxel - min_xyz
+    segment_coords_local = (segment_coords - min_xyz).astype(np.int32)
+    local_mask[
+        segment_coords_local[:, 0],
+        segment_coords_local[:, 1],
+        segment_coords_local[:, 2],
+    ] = True
+
+    local_skeleton = skeletonize(local_mask)
+    skeleton_coords_local = np.argwhere(local_skeleton > 0).astype(np.int32)
+    if len(skeleton_coords_local) == 0:
+        return []
+
+    endpoint_coords_local: List[np.ndarray] = []
+    for coord_local in skeleton_coords_local:
+        if _count_skeleton_neighbors(local_skeleton, coord_local) <= 1:
+            endpoint_coords_local.append(coord_local)
+    if len(endpoint_coords_local) == 0:
+        return []
+
+    centroid_local = segment_coords_local.astype(np.float32).mean(axis=0, keepdims=True)
+    endpoint_coords_local = sorted(
+        endpoint_coords_local,
+        key=lambda c: float(np.sum((c.astype(np.float32) - centroid_local[0]) ** 2)),
+        reverse=True,
+    )
+
+    accepted: List[Tuple[int, int, int]] = []
+    accepted_pts: List[np.ndarray] = []
+    segment_coords_f = segment_coords.astype(np.float32)
+    min_body_distance = max(1.0, float(skeleton_respawn_offset) * 0.5)
+    min_seed_distance2 = float(min_seed_distance) * float(min_seed_distance)
+    min_body_distance2 = float(min_body_distance) * float(min_body_distance)
+
+    for endpoint_local in endpoint_coords_local:
+        outward_dir = _estimate_endpoint_outward_direction(endpoint_local, skeleton_coords_local)
+        if outward_dir is None:
+            continue
+
+        endpoint_global = endpoint_local.astype(np.float32) + min_xyz.astype(np.float32)
+        candidate = np.rint(endpoint_global + outward_dir * float(skeleton_respawn_offset)).astype(np.int32)
+        z, y, x = [int(v) for v in candidate.tolist()]
+
+        # Filtering rules:
+        # 1) stay inside the volume bounds
+        # 2) never land inside trusted_mask
+        if (
+            z < 0
+            or y < 0
+            or x < 0
+            or z >= trusted_mask.shape[0]
+            or y >= trusted_mask.shape[1]
+            or x >= trusted_mask.shape[2]
+        ):
+            continue
+        if trusted_mask[z, y, x] > 0:
+            continue
+
+        # 3) keep the new seed away from the existing segment body so we extend outward instead of
+        #    respawning back inside the same local component.
+        candidate_f = candidate.astype(np.float32)
+        if np.min(np.sum((segment_coords_f - candidate_f[None, :]) ** 2, axis=1)) < min_body_distance2:
+            continue
+
+        # 4) keep proposed seeds sufficiently separated from each other.
+        if len(accepted_pts) > 0:
+            d2 = [float(np.sum((pt - candidate_f) ** 2)) for pt in accepted_pts]
+            if min(d2) < min_seed_distance2:
+                continue
+
+        accepted.append((z, y, x))
+        accepted_pts.append(candidate_f)
+        if len(accepted) >= int(max_skeleton_respawn_seeds):
+            break
+
+    return accepted
+
+
+def commit_segment(
+    seg_frames: List[SegmentFrame],
+    covered_mask: np.ndarray,
+    trusted_mask: np.ndarray,
+    track_axis: int,
+    args,
+    force_trusted: bool = False,
+    respawn_seed_override: Optional[List[Tuple[int, int, int]]] = None,
+    classification_category: Optional[str] = None,
+):
     if len(seg_frames) == 0:
         return [], None
 
@@ -168,11 +315,34 @@ def commit_segment(seg_frames: List[SegmentFrame], covered_mask: np.ndarray, tru
             update_mask_volume(trusted_mask, item.mask, item.axis, (item.global_frame_idx, *item.box[1:]))
         return [], SegmentDecision(is_trusted=True, dominant_axis=track_axis, axis_ratio=np.inf, spans=(0, 0, 0))
 
+    if getattr(args, "disable_legacy_segment_trust_respawn", False):
+        # In classifier-only mode:
+        # - stable segments are treated as trusted
+        # - complex / failure segments are treated as non-trusted
+        # - legacy FPS respawn is disabled; only an explicit override (e.g. skeleton respawn) may spawn seeds
+        is_trusted = classification_category == "stable"
+        decision = SegmentDecision(
+            is_trusted=bool(is_trusted),
+            dominant_axis=track_axis if is_trusted else -1,
+            axis_ratio=np.inf if is_trusted else 0.0,
+            spans=(0, 0, 0),
+        )
+        if is_trusted:
+            for item in seg_frames:
+                update_mask_volume(trusted_mask, item.mask, item.axis, (item.global_frame_idx, *item.box[1:]))
+            return [], decision
+        if respawn_seed_override is not None:
+            return list(respawn_seed_override), decision
+        return [], decision
+
     decision = judge_segment_direction(seg_frames=seg_frames, track_axis=track_axis, axis_ratio_thr=args.axis_ratio_thr)
     if decision.is_trusted:
         for item in seg_frames:
             update_mask_volume(trusted_mask, item.mask, item.axis, (item.global_frame_idx, *item.box[1:]))
         return [], decision
+
+    if respawn_seed_override is not None:
+        return list(respawn_seed_override), decision
 
     new_seeds = sample_respawn_seeds_from_segment(
         seg_frames=seg_frames,

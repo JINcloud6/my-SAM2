@@ -272,7 +272,7 @@ def evaluate_axis_joint_init(img_predictor, vol_man, seed, axis, box, args, axis
     )
 
 
-def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
+def prepare_seed_init_joint_energy(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
     crops = vol_man.get_triplane_crops(seed)
     axis_results: List[JointInitResult] = []
 
@@ -298,6 +298,44 @@ def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[
 
     axis_results.sort(key=lambda x: (x.best_energy, x.avg_area, x.axis))
     return axis_results[0]
+
+
+def prepare_seed_init_preselect_axis(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
+    crops = vol_man.get_triplane_crops(seed)
+    autocast_device = str(getattr(vol_man, "device", "cuda")).split(":")[0]
+    best_axis, best_mask = select_best_axis_seed_mask(
+        img_predictor=img_predictor,
+        crops=crops,
+        seed=seed,
+        max_init_mask_area=args.max_init_mask_area,
+        autocast_device=autocast_device,
+    )
+    if best_axis == -1 or best_mask is None or int(best_mask.sum()) == 0:
+        return None
+    if int(best_mask.sum()) > args.max_init_mask_area:
+        return None
+
+    _, box = crops[best_axis]
+    axis_seed = int(base_rng.integers(0, 2**31 - 1))
+    axis_rng = np.random.default_rng(axis_seed)
+    return evaluate_axis_joint_init(
+        img_predictor=img_predictor,
+        vol_man=vol_man,
+        seed=seed,
+        axis=best_axis,
+        box=box,
+        args=args,
+        axis_rng=axis_rng,
+    )
+
+
+def prepare_seed_init(img_predictor, vol_man, seed, args, base_rng) -> Optional[JointInitResult]:
+    mode = getattr(args, "joint_init_axis_mode", "preselect")
+    if mode == "preselect":
+        return prepare_seed_init_preselect_axis(img_predictor, vol_man, seed, args, base_rng)
+    if mode == "joint_energy":
+        return prepare_seed_init_joint_energy(img_predictor, vol_man, seed, args, base_rng)
+    raise ValueError(f"Unsupported joint_init_axis_mode: {mode}")
 
 
 def prepare_basic_seed_init(img_predictor, vol_man, seed, args) -> Optional[JointInitResult]:

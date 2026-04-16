@@ -106,7 +106,12 @@ def load_mask(path: str) -> np.ndarray:
 
 
 def default_init_seg_basename(args) -> str:
-    return f"init_seg_axis{args.axis}_s{args.stride}_t{args.remove_portion}.h5"
+    return (
+        f"init_seg_axis{args.axis}"
+        f"_s{args.stride}"
+        f"_t{args.remove_portion}"
+        f"_g{args.gaussian_kernel}.h5"
+    )
 
 
 def shared_auto_init_seg_basename(args) -> str:
@@ -141,7 +146,79 @@ def get_args():
     parser.add_argument("--gaussian_kernel", type=int, default=5)
     parser.add_argument("--min_bright", type=int, default=40)
     parser.add_argument("--remove_portion", type=float, default=0.98)
+    parser.add_argument("--max_track_distance", type=int, default=2000)
+    parser.add_argument("--max_init_mask_area", type=int, default=12000)
+    parser.add_argument("--max_segmented_seeds", type=int, default=200)
     parser.add_argument("--max_slice_mask_area", type=int, default=12000)
+    parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
+    parser.add_argument("--enable_seed_judge", action="store_true")
+    parser.add_argument("--disable_joint_init", action="store_true")
+    parser.add_argument(
+        "--joint_init_axis_mode",
+        default="preselect",
+        choices=["preselect", "joint_energy"],
+    )
+    parser.add_argument("--init_half_window", type=int, default=6)
+    parser.add_argument("--top_k", type=int, default=6)
+    parser.add_argument("--num_point_jitters", type=int, default=3)
+    parser.add_argument("--jitter_radius", type=float, default=6.0)
+    parser.add_argument("--w_score", type=float, default=1.0)
+    parser.add_argument("--w_iou", type=float, default=3.0)
+    parser.add_argument("--w_centroid", type=float, default=0.03)
+    parser.add_argument("--w_area", type=float, default=0.6)
+    parser.add_argument("--empty_mask_penalty", type=float, default=6.0)
+    parser.add_argument("--max_joint_avg_area", type=float, default=12000.0)
+    parser.add_argument("--robust_trials", type=int, default=5)
+    parser.add_argument("--thr_best_energy", type=float, default=38.0)
+    parser.add_argument("--thr_energy_std", type=float, default=2.2)
+    parser.add_argument("--thr_energy_uniformity", type=float, default=0.35)
+    parser.add_argument("--thr_robust_energy_cv", type=float, default=0.18)
+    parser.add_argument("--thr_robust_path_iou", type=float, default=0.58)
+    parser.add_argument("--thr_avg_area_min", type=float, default=20.0)
+    parser.add_argument("--thr_avg_area_max", type=float, default=12000.0)
+    parser.add_argument("--random_seed", type=int, default=123)
+    parser.add_argument("--enable_respawn", action="store_true")
+    parser.add_argument("--disable_longterm_memory", action="store_true")
+    parser.add_argument("--segment_len", type=int, default=15)
+    parser.add_argument("--segment_len_diameter_multiplier", type=float, default=0.0)
+    parser.add_argument("--min_segment_frames", type=int, default=5)
+    parser.add_argument("--axis_ratio_thr", type=float, default=1.1)
+    parser.add_argument("--segment_respawn_num_seeds", type=int, default=4)
+    parser.add_argument("--segment_respawn_min_distance", type=float, default=20.0)
+    parser.add_argument("--max_segment_respawn_candidates", type=int, default=2048)
+    parser.add_argument("--enable_skeleton_respawn", action="store_true")
+    parser.add_argument("--disable_legacy_segment_trust_respawn", action="store_true")
+    parser.add_argument("--skeleton_respawn_offset", type=float, default=12.0)
+    parser.add_argument("--max_skeleton_respawn_seeds", type=int, default=4)
+    parser.add_argument("--max_untrusted_segments_per_lineage", type=int, default=1)
+    parser.add_argument("--min_respawn_mask_area", type=int, default=20)
+    parser.add_argument("--respawn_num_seeds", type=int, default=2)
+    parser.add_argument("--respawn_min_point_distance", type=float, default=24.0)
+    parser.add_argument("--max_respawn_candidates", type=int, default=512)
+    parser.add_argument("--longterm_segment_len", type=int, default=12)
+    parser.add_argument("--longterm_quality_thr", type=float, default=0.8)
+    parser.add_argument("--max_longterm_segments", type=int, default=5)
+    parser.add_argument("--working_window", type=int, default=24)
+    parser.add_argument("--max_global_inject_per_seed", type=int, default=0)
+    parser.add_argument("--enable_segment_classifier_labels", action="store_true")
+    parser.add_argument("--segment_label_output_filename", default="mousep4_segment_class_labels.nii.gz")
+    parser.add_argument("--segment_classifier_stable_quality_thr", type=float, default=0.80)
+    parser.add_argument("--segment_classifier_stable_iou_thr", type=float, default=0.65)
+    parser.add_argument("--segment_classifier_stable_empty_rate_thr", type=float, default=0.05)
+    parser.add_argument("--segment_classifier_stable_axis_ratio_thr", type=float, default=1.10)
+    parser.add_argument("--segment_classifier_boundary_tail_max_frames", type=int, default=6)
+    parser.add_argument("--segment_classifier_complex_tube_score_thr", type=float, default=2.5)
+    parser.add_argument("--disable_segment_classifier_dominant_axis_check", action="store_true")
+    parser.add_argument("--segment_classifier_failure_quality_thr", type=float, default=0.55)
+    parser.add_argument("--segment_classifier_failure_iou_thr", type=float, default=0.20)
+    parser.add_argument("--segment_classifier_failure_empty_rate_thr", type=float, default=0.25)
+    parser.add_argument("--segment_classifier_failure_min_frames", type=int, default=3)
+    parser.add_argument("--print_segment_classifier_details", action="store_true")
+    parser.add_argument("--enable_segmented_seed_logging", action="store_true")
+    parser.add_argument("--segmented_seed_log_filename", default="segmented_seeds.csv")
+    parser.add_argument("--print_total_runtime", action="store_true")
+    parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
+    parser.add_argument("--keep_tmp_vos_frames", action="store_true")
     parser.add_argument("--chunk_size", type=int, default=512)
     parser.add_argument("--chunks_subdir", default="chunks")
     parser.add_argument("--merged_subdir", default="merged")
@@ -164,6 +241,15 @@ def get_args():
     return parser.parse_known_args()
 
 
+def append_value_arg(cmd: List[str], flag: str, value) -> None:
+    cmd.extend([flag, str(value)])
+
+
+def append_flag_arg(cmd: List[str], flag: str, enabled: bool) -> None:
+    if enabled:
+        cmd.append(flag)
+
+
 def build_child_cmd(
     args,
     passthrough_args: Sequence[str],
@@ -178,43 +264,104 @@ def build_child_cmd(
         sys.executable,
         "-m",
         "vessel_model.sam2_main4_hybrid",
-        "--sam2_checkpoint",
-        args.sam2_checkpoint,
-        "--sam2_model_cfg",
-        args.sam2_model_cfg,
-        "--volume_path",
-        chunk_volume_path,
-        "--output_dir",
-        chunk_output_dir,
-        "--output_filename",
-        chunk_output_filename,
-        "--axis_sequence_cache_root",
-        axis_sequence_cache_root,
-        "--feature_cache_device",
-        args.feature_cache_device,
-        "--dataset_key",
-        args.dataset_key,
-        "--axis",
-        str(args.axis),
-        "--stride",
-        str(args.stride),
-        "--gaussian_kernel",
-        str(args.gaussian_kernel),
-        "--min_bright",
-        str(args.min_bright),
-        "--remove_portion",
-        str(args.remove_portion),
-        "--cuda_device",
-        str(args.cuda_device),
-        "--device",
-        args.device,
-        "--max_slice_mask_area",
-        str(args.max_slice_mask_area),
-        "--need_transpose",
-        "False",
     ]
-    if args.enable_axis_feature_cache:
-        cmd.append("--enable_axis_feature_cache")
+    append_value_arg(cmd, "--sam2_checkpoint", args.sam2_checkpoint)
+    append_value_arg(cmd, "--sam2_model_cfg", args.sam2_model_cfg)
+    append_value_arg(cmd, "--volume_path", chunk_volume_path)
+    append_value_arg(cmd, "--output_dir", chunk_output_dir)
+    append_value_arg(cmd, "--output_filename", chunk_output_filename)
+    append_value_arg(cmd, "--axis_sequence_cache_root", axis_sequence_cache_root)
+    append_value_arg(cmd, "--feature_cache_device", args.feature_cache_device)
+    append_value_arg(cmd, "--dataset_key", args.dataset_key)
+    append_value_arg(cmd, "--axis", args.axis)
+    append_value_arg(cmd, "--stride", args.stride)
+    append_value_arg(cmd, "--gaussian_kernel", args.gaussian_kernel)
+    append_value_arg(cmd, "--min_bright", args.min_bright)
+    append_value_arg(cmd, "--remove_portion", args.remove_portion)
+    append_value_arg(cmd, "--cuda_device", args.cuda_device)
+    append_value_arg(cmd, "--device", args.device)
+    append_value_arg(cmd, "--need_transpose", "False")
+
+    value_arg_names = [
+        "max_track_distance",
+        "max_init_mask_area",
+        "max_segmented_seeds",
+        "max_slice_mask_area",
+        "max_slice_mask_ratio",
+        "joint_init_axis_mode",
+        "init_half_window",
+        "top_k",
+        "num_point_jitters",
+        "jitter_radius",
+        "w_score",
+        "w_iou",
+        "w_centroid",
+        "w_area",
+        "empty_mask_penalty",
+        "max_joint_avg_area",
+        "robust_trials",
+        "thr_best_energy",
+        "thr_energy_std",
+        "thr_energy_uniformity",
+        "thr_robust_energy_cv",
+        "thr_robust_path_iou",
+        "thr_avg_area_min",
+        "thr_avg_area_max",
+        "random_seed",
+        "segment_len",
+        "segment_len_diameter_multiplier",
+        "min_segment_frames",
+        "axis_ratio_thr",
+        "segment_respawn_num_seeds",
+        "segment_respawn_min_distance",
+        "max_segment_respawn_candidates",
+        "skeleton_respawn_offset",
+        "max_skeleton_respawn_seeds",
+        "max_untrusted_segments_per_lineage",
+        "min_respawn_mask_area",
+        "respawn_num_seeds",
+        "respawn_min_point_distance",
+        "max_respawn_candidates",
+        "longterm_segment_len",
+        "longterm_quality_thr",
+        "max_longterm_segments",
+        "working_window",
+        "max_global_inject_per_seed",
+        "segment_label_output_filename",
+        "segment_classifier_stable_quality_thr",
+        "segment_classifier_stable_iou_thr",
+        "segment_classifier_stable_empty_rate_thr",
+        "segment_classifier_stable_axis_ratio_thr",
+        "segment_classifier_boundary_tail_max_frames",
+        "segment_classifier_complex_tube_score_thr",
+        "segment_classifier_failure_quality_thr",
+        "segment_classifier_failure_iou_thr",
+        "segment_classifier_failure_empty_rate_thr",
+        "segment_classifier_failure_min_frames",
+        "segmented_seed_log_filename",
+    ]
+    for name in value_arg_names:
+        append_value_arg(cmd, f"--{name}", getattr(args, name))
+
+    flag_arg_names = [
+        "enable_axis_feature_cache",
+        "enable_seed_judge",
+        "disable_joint_init",
+        "enable_respawn",
+        "disable_longterm_memory",
+        "enable_skeleton_respawn",
+        "disable_legacy_segment_trust_respawn",
+        "enable_segment_classifier_labels",
+        "disable_segment_classifier_dominant_axis_check",
+        "print_segment_classifier_details",
+        "enable_segmented_seed_logging",
+        "print_total_runtime",
+        "vos_offload_video_to_cpu",
+        "keep_tmp_vos_frames",
+    ]
+    for name in flag_arg_names:
+        append_flag_arg(cmd, f"--{name}", bool(getattr(args, name)))
+
     if chunk_seed_path is not None:
         cmd.extend(["--seed_file", chunk_seed_path])
     if chunk_init_seg_path is not None:
@@ -224,6 +371,7 @@ def build_child_cmd(
 
 
 def main():
+    run_start_time = time.perf_counter()
     args, passthrough_args = get_args()
     os.makedirs(args.output_dir, exist_ok=True)
     run_prefix = args.run_prefix or (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8])
@@ -342,6 +490,9 @@ def main():
     print(f"Chunks merged: {processed_chunks}")
     print(f"Chunks skipped without local seeds: {skipped_chunks}")
     print(f"Merged segmentation saved to: {merged_path}")
+    if args.print_total_runtime:
+        elapsed_sec = time.perf_counter() - run_start_time
+        print(f"Total tiled runtime: {elapsed_sec:.2f}s")
 
 
 if __name__ == "__main__":

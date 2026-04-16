@@ -7,7 +7,7 @@ import torch
 from ..global_memory_pool import GlobalMemoryPool
 from .axis_cache import init_state_from_axis_cache
 from .common import SeedTask, sample_respawn_seeds_from_mask
-from .segment_trust import SegmentFrame, commit_segment
+from .segment_trust import SegmentFrame, commit_segment, propose_skeleton_respawn_seeds
 from .unified_segment_classifier import (
     ClassifiedSegmentFrame,
     classify_segment,
@@ -179,7 +179,10 @@ def track_one_direction_hybrid(
             classified_seg_cache: List[ClassifiedSegmentFrame] = []
             current_segment_len_target: Optional[int] = None
             enable_segment_classification = (
-                (segment_label_mask is not None) or getattr(args, "print_segment_classifier_details", False)
+                (segment_label_mask is not None)
+                or getattr(args, "print_segment_classifier_details", False)
+                or getattr(args, "enable_skeleton_respawn", False)
+                or getattr(args, "disable_legacy_segment_trust_respawn", False)
             )
 
             def ensure_segment_len_target(mask: np.ndarray) -> int:
@@ -316,6 +319,7 @@ def track_one_direction_hybrid(
             seg_cache: List[FrameQuality] = []
             prev_mask = prev_nonempty_mask
             current_untrusted_count = int(start_untrusted_count)
+            classification_result = None
 
             for f_idx, _obj_ids, masks in video_predictor.propagate_in_video(state):
                 if int(f_idx) not in valid_gidx_set:
@@ -329,12 +333,25 @@ def track_one_direction_hybrid(
 
                 gidx = int(f_idx)
                 if mm.sum() == 0:
-                    _flush_classified_segment(
+                    classification_result = _flush_classified_segment(
                         empty_frame_count=1,
                         terminated_by_boundary=False,
                         termination_reason="empty_frame",
                     )
                     if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
+                        respawn_seed_override = None
+                        if (
+                            getattr(args, "enable_skeleton_respawn", False)
+                            and classification_result is not None
+                            and classification_result.category == "complex"
+                        ):
+                            respawn_seed_override = propose_skeleton_respawn_seeds(
+                                seg_frames=trust_seg_cache,
+                                trusted_mask=trusted_mask,
+                                skeleton_respawn_offset=float(args.skeleton_respawn_offset),
+                                max_skeleton_respawn_seeds=int(args.max_skeleton_respawn_seeds),
+                                min_seed_distance=float(args.segment_respawn_min_distance),
+                            )
                         force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                         new_seeds, decision = commit_segment(
                             seg_frames=trust_seg_cache,
@@ -343,6 +360,10 @@ def track_one_direction_hybrid(
                             track_axis=axis,
                             args=args,
                             force_trusted=force_trusted,
+                            respawn_seed_override=respawn_seed_override,
+                            classification_category=(
+                                None if classification_result is None else classification_result.category
+                            ),
                         )
                         if decision is not None:
                             if decision.is_trusted:
@@ -439,7 +460,7 @@ def track_one_direction_hybrid(
                         seg_cache = []
 
                 if enable_segment_classification and len(classified_seg_cache) >= current_target:
-                    _flush_classified_segment(
+                    classification_result = _flush_classified_segment(
                         empty_frame_count=0,
                         terminated_by_boundary=False,
                         termination_reason="segment_len",
@@ -447,6 +468,20 @@ def track_one_direction_hybrid(
                     reset_segment_len_target()
 
                 if args.enable_respawn and len(trust_seg_cache) >= current_target:
+                    respawn_seed_override = None
+                    if (
+                        getattr(args, "enable_skeleton_respawn", False)
+                        and enable_segment_classification
+                        and classification_result is not None
+                        and classification_result.category == "complex"
+                    ):
+                        respawn_seed_override = propose_skeleton_respawn_seeds(
+                            seg_frames=trust_seg_cache,
+                            trusted_mask=trusted_mask,
+                            skeleton_respawn_offset=float(args.skeleton_respawn_offset),
+                            max_skeleton_respawn_seeds=int(args.max_skeleton_respawn_seeds),
+                            min_seed_distance=float(args.segment_respawn_min_distance),
+                        )
                     force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                     new_seeds, decision = commit_segment(
                         seg_frames=trust_seg_cache,
@@ -455,6 +490,10 @@ def track_one_direction_hybrid(
                         track_axis=axis,
                         args=args,
                         force_trusted=force_trusted,
+                        respawn_seed_override=respawn_seed_override,
+                        classification_category=(
+                            None if classification_result is None else classification_result.category
+                        ),
                     )
                     if decision is not None:
                         if decision.is_trusted:
@@ -494,13 +533,26 @@ def track_one_direction_hybrid(
                     reached_dataset_boundary = last_gidx >= int(axis_sequence_cache.num_frames) - 1
                 else:
                     reached_dataset_boundary = last_gidx <= 0
-            _flush_classified_segment(
+            classification_result = _flush_classified_segment(
                 empty_frame_count=0,
                 terminated_by_boundary=reached_dataset_boundary,
                 termination_reason="dataset_boundary" if reached_dataset_boundary else "direction_end",
             )
             reset_segment_len_target()
             if args.enable_respawn and len(trust_seg_cache) >= args.min_segment_frames:
+                respawn_seed_override = None
+                if (
+                    getattr(args, "enable_skeleton_respawn", False)
+                    and classification_result is not None
+                    and classification_result.category == "complex"
+                ):
+                    respawn_seed_override = propose_skeleton_respawn_seeds(
+                        seg_frames=trust_seg_cache,
+                        trusted_mask=trusted_mask,
+                        skeleton_respawn_offset=float(args.skeleton_respawn_offset),
+                        max_skeleton_respawn_seeds=int(args.max_skeleton_respawn_seeds),
+                        min_seed_distance=float(args.segment_respawn_min_distance),
+                    )
                 force_trusted = current_untrusted_count >= args.max_untrusted_segments_per_lineage
                 new_seeds, decision = commit_segment(
                     seg_frames=trust_seg_cache,
@@ -509,6 +561,10 @@ def track_one_direction_hybrid(
                     track_axis=axis,
                     args=args,
                     force_trusted=force_trusted,
+                    respawn_seed_override=respawn_seed_override,
+                    classification_category=(
+                        None if classification_result is None else classification_result.category
+                    ),
                 )
                 if decision is not None:
                     if decision.is_trusted:

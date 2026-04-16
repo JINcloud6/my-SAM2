@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections import deque
-from typing import Deque, Dict, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import hydra
 import numpy as np
@@ -62,6 +62,16 @@ def get_args():
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--disable_joint_init", action="store_true")
+    parser.add_argument(
+        "--joint_init_axis_mode",
+        default="preselect",
+        choices=["preselect", "joint_energy"],
+        help=(
+            "How to choose the axis for MSJI. 'preselect' first chooses one axis using "
+            "single-slice SAM initialization and then runs MSJI only on that axis. "
+            "'joint_energy' runs MSJI on all three axes and picks the lowest-energy path."
+        ),
+    )
     parser.add_argument("--init_half_window", type=int, default=6)
     parser.add_argument("--top_k", type=int, default=6)
     parser.add_argument("--num_point_jitters", type=int, default=3)
@@ -96,6 +106,28 @@ def get_args():
     parser.add_argument("--segment_respawn_num_seeds", type=int, default=4)
     parser.add_argument("--segment_respawn_min_distance", type=float, default=20.0)
     parser.add_argument("--max_segment_respawn_candidates", type=int, default=2048)
+    parser.add_argument(
+        "--enable_skeleton_respawn",
+        action="store_true",
+        help="For segments already classified as complex, use skeleton endpoint extrapolation instead of the legacy FPS respawn.",
+    )
+    parser.add_argument(
+        "--disable_legacy_segment_trust_respawn",
+        action="store_true",
+        help="Disable legacy direction-based trust/untrust judgment and legacy FPS respawn; use unified segment classification instead.",
+    )
+    parser.add_argument(
+        "--skeleton_respawn_offset",
+        type=float,
+        default=12.0,
+        help="Distance to extend outward from a local 3D skeleton endpoint when proposing skeleton-based respawn seeds.",
+    )
+    parser.add_argument(
+        "--max_skeleton_respawn_seeds",
+        type=int,
+        default=4,
+        help="Maximum number of skeleton-based respawn seeds to return for one complex segment.",
+    )
     parser.add_argument("--max_untrusted_segments_per_lineage", type=int, default=1)
     parser.add_argument("--min_respawn_mask_area", type=int, default=20)
     parser.add_argument("--respawn_num_seeds", type=int, default=2)
@@ -139,6 +171,21 @@ def get_args():
         action="store_true",
         help="Print per-segment stable rule violations with actual metric values and thresholds.",
     )
+    parser.add_argument(
+        "--enable_segmented_seed_logging",
+        action="store_true",
+        help="Print how many actually segmented seeds are original vs respawned, and save all actually segmented seed positions with their type.",
+    )
+    parser.add_argument(
+        "--segmented_seed_log_filename",
+        default="segmented_seeds.csv",
+        help="CSV filename used when --enable_segmented_seed_logging is on.",
+    )
+    parser.add_argument(
+        "--print_total_runtime",
+        action="store_true",
+        help="Print total end-to-end segmentation runtime when the program finishes.",
+    )
 
     parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
     parser.add_argument("--keep_tmp_vos_frames", action="store_true")
@@ -161,8 +208,19 @@ def prepare_init_result(task: SeedTask, img_predictor, vol_man, args, rng) -> Op
     return prepare_seed_init(img_predictor, vol_man, task.seed, args, rng)
 
 
+def save_segmented_seed_records(path: str, records: List[Dict[str, object]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("z,y,x,seed_type,untrusted_count,selected_axis\n")
+        for item in records:
+            f.write(
+                f"{int(item['z'])},{int(item['y'])},{int(item['x'])},"
+                f"{item['seed_type']},{int(item['untrusted_count'])},{int(item['selected_axis'])}\n"
+            )
+
+
 def run_segmentation():
     args = get_args()
+    run_start_time = time.perf_counter()
     os.makedirs(args.output_dir, exist_ok=True)
     device = resolve_torch_device(args)
     rng = np.random.default_rng(args.random_seed)
@@ -196,6 +254,9 @@ def run_segmentation():
         flag = (args.need_transpose != "False")
         print("No seeds available for SAM2 tracking. Saving empty mask.")
         vol_man.save(final_path, flag)
+        if args.enable_segmented_seed_logging:
+            segmented_seed_log_path = os.path.join(args.output_dir, args.segmented_seed_log_filename)
+            save_segmented_seed_records(segmented_seed_log_path, [])
         if args.enable_segment_classifier_labels:
             empty_label_mask = np.zeros_like(vol_man.vol, dtype=np.uint8)
             segment_label_path = os.path.join(args.output_dir, args.segment_label_output_filename)
@@ -206,6 +267,9 @@ def run_segmentation():
                 flag,
             )
         print(f"Done! Saved empty mask to {final_path}")
+        if args.print_total_runtime:
+            elapsed_sec = time.perf_counter() - run_start_time
+            print(f"Total runtime: {elapsed_sec:.2f}s")
         return
 
     pending: Deque[SeedTask] = deque([SeedTask(seed=s, is_original=True) for s in initial_seeds])
@@ -232,6 +296,9 @@ def run_segmentation():
     failure_segment_count = 0
     complex_reason_counts: Dict[str, int] = {}
     complex_reason_combo_counts: Dict[str, int] = {}
+    segmented_original_count = 0
+    segmented_respawn_count = 0
+    segmented_seed_records: List[Dict[str, object]] = []
 
     pbar = tqdm(total=len(pending), desc="Tracking (SAM2 hybrid)")
     while len(pending) > 0:
@@ -264,6 +331,23 @@ def run_segmentation():
             continue
 
         segmented_count += 1
+        if task.is_original:
+            segmented_original_count += 1
+            seed_type = "original"
+        else:
+            segmented_respawn_count += 1
+            seed_type = "respawn"
+        if args.enable_segmented_seed_logging:
+            segmented_seed_records.append(
+                {
+                    "z": int(seed[0]),
+                    "y": int(seed[1]),
+                    "x": int(seed[2]),
+                    "seed_type": seed_type,
+                    "untrusted_count": int(task.untrusted_count),
+                    "selected_axis": int(init_result.axis),
+                }
+            )
         track_dim = [0, 1, 2][init_result.axis]
         start_idx = seed[track_dim]
         max_dist = args.max_track_distance
@@ -357,6 +441,9 @@ def run_segmentation():
 
     print("=" * 80)
     print(f"Segmented seeds actually run: {segmented_count}")
+    if args.enable_segmented_seed_logging:
+        print(f"Segmented original seeds: {segmented_original_count}")
+        print(f"Segmented respawn seeds: {segmented_respawn_count}")
     print(f"Rejected seeds: {rejected_count}")
     print(f"Respawned seeds queued: {respawned_count}")
     print(f"Promoted long-term segments: {promoted_longterm}")
@@ -377,6 +464,13 @@ def run_segmentation():
     print(f"Done! Saved to {final_path}")
     if saved_label_path is not None:
         print(f"Segment class labels saved to {saved_label_path}")
+    if args.enable_segmented_seed_logging:
+        segmented_seed_log_path = os.path.join(args.output_dir, args.segmented_seed_log_filename)
+        save_segmented_seed_records(segmented_seed_log_path, segmented_seed_records)
+        print(f"Segmented seed log saved to {segmented_seed_log_path}")
+    if args.print_total_runtime:
+        elapsed_sec = time.perf_counter() - run_start_time
+        print(f"Total runtime: {elapsed_sec:.2f}s")
 
 
 if __name__ == "__main__":

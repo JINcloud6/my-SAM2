@@ -48,7 +48,12 @@ def load_or_build_seeds(args, vol_man) -> List[Tuple[int, int, int]]:
                 seeds.append(tuple(parts))
         return seeds
 
-    default_init_seg_name = f"init_seg_axis{args.axis}_s{args.stride}_t{args.remove_portion}.h5"
+    default_init_seg_name = (
+        f"init_seg_axis{args.axis}"
+        f"_s{args.stride}"
+        f"_t{args.remove_portion}"
+        f"_g{args.gaussian_kernel}.h5"
+    )
     init_seg_path = args.init_seg_path or os.path.join(args.output_dir, default_init_seg_name)
 
     if os.path.exists(init_seg_path):
