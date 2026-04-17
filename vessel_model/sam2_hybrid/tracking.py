@@ -38,18 +38,55 @@ def mask_iou(a, b):
     return float(inter) / float(uni) if uni > 0 else 0.0
 
 
-def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
+def mask_score_from_logits(mask_logits, mask_bin):
+    """Mean SAM2 foreground probability inside the predicted binary mask."""
     if torch.is_tensor(mask_logits):
         probs = torch.sigmoid(mask_logits).detach().float().cpu().numpy()
     else:
-        probs = 1.0 / (1.0 + np.exp(-mask_logits))
+        logits = np.asarray(mask_logits, dtype=np.float32)
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
 
-    conf = float(probs[mask_bin > 0].mean()) if mask_bin.sum() > 0 else 0.0
+    return float(probs[mask_bin > 0].mean()) if mask_bin.sum() > 0 else 0.0
+
+
+def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
+    conf = mask_score_from_logits(mask_logits, mask_bin)
     if prev_mask is None or prev_mask.sum() == 0 or mask_bin.sum() == 0:
         stab = 0.0
     else:
         stab = mask_iou(prev_mask, mask_bin)
     return 0.7 * conf + 0.3 * stab
+
+
+def siou_from_score_info(score_info, obj_index: int = 0) -> Optional[float]:
+    if score_info is None:
+        return None
+    siou = score_info.get("siou", None)
+    if siou is None:
+        return None
+    if torch.is_tensor(siou):
+        arr = siou.detach().float().cpu().numpy()
+    else:
+        arr = np.asarray(siou, dtype=np.float32)
+    if arr.size == 0:
+        return None
+    arr = arr.reshape(arr.shape[0], -1)
+    if obj_index < 0 or obj_index >= arr.shape[0]:
+        return None
+    return float(np.max(arr[obj_index]))
+
+
+def propagate_in_video_optional_scores(video_predictor, state, need_scores: bool):
+    if not need_scores:
+        return video_predictor.propagate_in_video(state)
+    try:
+        return video_predictor.propagate_in_video(state, return_scores=True)
+    except TypeError as exc:
+        raise RuntimeError(
+            "The active sam2.sam2_video_predictor.SAM2VideoPredictor does not support "
+            "propagate_in_video(..., return_scores=True). Please make sure Python imports "
+            "the modified SAM2 source under this repository before using --min_frame_siou."
+        ) from exc
 
 
 def segment_len_target_from_first_mask(mask: np.ndarray, args) -> int:
@@ -137,6 +174,8 @@ def track_one_direction_hybrid(
         "untrusted_segments": 0,
         "final_untrusted_count": int(start_untrusted_count),
         "terminated_large_mask": False,
+        "terminated_low_score_mask": False,
+        "terminated_low_siou_mask": False,
         "stable_segments": 0,
         "complex_segments": 0,
         "failure_segments": 0,
@@ -157,6 +196,8 @@ def track_one_direction_hybrid(
     trusted_segments = 0
     untrusted_segments = 0
     terminated_large_mask = False
+    terminated_low_score_mask = False
+    terminated_low_siou_mask = False
     stable_segments = 0
     complex_segments = 0
     failure_segments = 0
@@ -320,8 +361,19 @@ def track_one_direction_hybrid(
             prev_mask = prev_nonempty_mask
             current_untrusted_count = int(start_untrusted_count)
             classification_result = None
+            min_frame_siou = float(getattr(args, "min_frame_siou", 0.0))
+            need_siou_scores = min_frame_siou > 0.0
 
-            for f_idx, _obj_ids, masks in video_predictor.propagate_in_video(state):
+            for propagation_out in propagate_in_video_optional_scores(
+                video_predictor,
+                state,
+                need_scores=need_siou_scores,
+            ):
+                if need_siou_scores:
+                    f_idx, _obj_ids, masks, score_info = propagation_out
+                else:
+                    f_idx, _obj_ids, masks = propagation_out
+                    score_info = None
                 if int(f_idx) not in valid_gidx_set:
                     continue
 
@@ -394,6 +446,37 @@ def track_one_direction_hybrid(
                     seg_cache = []
                     reset_segment_len_target()
                     break
+
+                if min_frame_siou > 0.0:
+                    frame_siou = siou_from_score_info(score_info, obj_index=0)
+                    if frame_siou is None:
+                        raise RuntimeError("SAM2 propagation did not return a valid siou score.")
+                    if frame_siou < min_frame_siou:
+                        terminated_low_siou_mask = True
+                        _flush_classified_segment(
+                            empty_frame_count=0,
+                            terminated_by_boundary=False,
+                            termination_reason="low_siou",
+                        )
+                        trust_seg_cache = []
+                        seg_cache = []
+                        reset_segment_len_target()
+                        break
+
+                min_frame_mask_score = float(getattr(args, "min_frame_mask_score", 0.0))
+                if min_frame_mask_score > 0.0:
+                    frame_mask_score = mask_score_from_logits(mm_logits, mm)
+                    if frame_mask_score < min_frame_mask_score:
+                        terminated_low_score_mask = True
+                        _flush_classified_segment(
+                            empty_frame_count=0,
+                            terminated_by_boundary=False,
+                            termination_reason="low_mask_score",
+                        )
+                        trust_seg_cache = []
+                        seg_cache = []
+                        reset_segment_len_target()
+                        break
 
                 # slice_area = float(mm.shape[0] * mm.shape[1])
                 # if slice_area > 0:
@@ -588,6 +671,8 @@ def track_one_direction_hybrid(
         "untrusted_segments": untrusted_segments,
         "final_untrusted_count": int(start_untrusted_count) if not args.enable_respawn else current_untrusted_count,
         "terminated_large_mask": terminated_large_mask,
+        "terminated_low_score_mask": terminated_low_score_mask,
+        "terminated_low_siou_mask": terminated_low_siou_mask,
         "stable_segments": stable_segments,
         "complex_segments": complex_segments,
         "failure_segments": failure_segments,

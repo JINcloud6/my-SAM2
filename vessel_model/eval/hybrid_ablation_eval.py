@@ -61,6 +61,8 @@ def main():
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
     parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
+    parser.add_argument("--min_frame_mask_score", type=float, default=0.0)
+    parser.add_argument("--min_frame_siou", type=float, default=0.0)
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--init_half_window", type=int, default=6)
@@ -146,6 +148,8 @@ def main():
             "--max_segmented_seeds", str(args.max_segmented_seeds),
             "--max_slice_mask_area", str(args.max_slice_mask_area),
             "--max_slice_mask_ratio", str(args.max_slice_mask_ratio),
+            "--min_frame_mask_score", str(args.min_frame_mask_score),
+            "--min_frame_siou", str(args.min_frame_siou),
             "--init_half_window", str(args.init_half_window),
             "--top_k", str(args.top_k),
             "--num_point_jitters", str(args.num_point_jitters),

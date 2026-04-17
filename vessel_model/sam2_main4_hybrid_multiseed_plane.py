@@ -22,6 +22,7 @@ from .sam2_hybrid.axis_cache import (
 )
 from .sam2_hybrid.common import SeedTask, load_or_build_seeds, select_mask_with_constraints
 from .sam2_hybrid.joint_init import JointInitResult, evaluate_axis_joint_init
+from .sam2_hybrid.tracking import mask_score_from_logits, propagate_in_video_optional_scores, siou_from_score_info
 
 
 @dataclass
@@ -67,6 +68,24 @@ def get_args():
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
     parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--min_frame_mask_score",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, terminate an object before writing a frame when the mean sigmoid score "
+            "inside its predicted mask is below this threshold."
+        ),
+    )
+    parser.add_argument(
+        "--min_frame_siou",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, request per-frame SAM2 decoder s_iou scores and terminate an object "
+            "before writing a frame when s_iou is below this threshold."
+        ),
+    )
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--disable_joint_init", action="store_true")
@@ -279,15 +298,27 @@ def track_seed_group_one_direction(
     args,
 ) -> Dict[str, int]:
     if len(idx_list) == 0 or len(group_items) == 0:
-        return {"tracked_objects": 0, "terminated_large_mask_objects": 0}
+        return {
+            "tracked_objects": 0,
+            "terminated_large_mask_objects": 0,
+            "terminated_low_score_mask_objects": 0,
+            "terminated_low_siou_mask_objects": 0,
+        }
 
     valid_gidx = [int(vidx) for vidx in idx_list if 0 <= int(vidx) < int(axis_sequence_cache.num_frames)]
     if len(valid_gidx) == 0:
-        return {"tracked_objects": 0, "terminated_large_mask_objects": 0}
+        return {
+            "tracked_objects": 0,
+            "terminated_large_mask_objects": 0,
+            "terminated_low_score_mask_objects": 0,
+            "terminated_low_siou_mask_objects": 0,
+        }
     valid_gidx_set = set(valid_gidx)
 
     tracked_objects = 0
     terminated_large_mask_objects = 0
+    terminated_low_score_mask_objects = 0
+    terminated_low_siou_mask_objects = 0
 
     with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
         state = init_state_from_axis_cache(
@@ -306,12 +337,28 @@ def track_seed_group_one_direction(
             valid_gidx_set=valid_gidx_set,
         )
         if len(active_objects) == 0:
-            return {"tracked_objects": 0, "terminated_large_mask_objects": 0}
+            return {
+                "tracked_objects": 0,
+                "terminated_large_mask_objects": 0,
+                "terminated_low_score_mask_objects": 0,
+                "terminated_low_siou_mask_objects": 0,
+            }
 
         tracked_objects = len(active_objects)
         terminated_obj_ids = set()
         obj_id_to_mask_index = {}
-        for f_idx, obj_ids, masks in video_predictor.propagate_in_video(state):
+        min_frame_siou = float(getattr(args, "min_frame_siou", 0.0))
+        need_siou_scores = min_frame_siou > 0.0
+        for propagation_out in propagate_in_video_optional_scores(
+            video_predictor,
+            state,
+            need_scores=need_siou_scores,
+        ):
+            if need_siou_scores:
+                f_idx, obj_ids, masks, score_info = propagation_out
+            else:
+                f_idx, obj_ids, masks = propagation_out
+                score_info = None
             gidx = int(f_idx)
             if gidx not in valid_gidx_set:
                 continue
@@ -342,6 +389,23 @@ def track_seed_group_one_direction(
                     terminated_large_mask_objects += 1
                     continue
 
+                if min_frame_siou > 0.0:
+                    frame_siou = siou_from_score_info(score_info, obj_index=mask_idx)
+                    if frame_siou is None:
+                        raise RuntimeError("SAM2 propagation did not return a valid siou score.")
+                    if frame_siou < min_frame_siou:
+                        terminated_obj_ids.add(int(obj_id))
+                        terminated_low_siou_mask_objects += 1
+                        continue
+
+                min_frame_mask_score = float(getattr(args, "min_frame_mask_score", 0.0))
+                if min_frame_mask_score > 0.0:
+                    frame_mask_score = mask_score_from_logits(mm_logits, mm)
+                    if frame_mask_score < min_frame_mask_score:
+                        terminated_obj_ids.add(int(obj_id))
+                        terminated_low_score_mask_objects += 1
+                        continue
+
                 vol_man.update_global_mask(mm.astype(np.uint8), axis, (gidx, *item.init_result.box[1:]))
 
             if len(terminated_obj_ids) >= len(active_objects):
@@ -350,6 +414,8 @@ def track_seed_group_one_direction(
     return {
         "tracked_objects": tracked_objects,
         "terminated_large_mask_objects": terminated_large_mask_objects,
+        "terminated_low_score_mask_objects": terminated_low_score_mask_objects,
+        "terminated_low_siou_mask_objects": terminated_low_siou_mask_objects,
     }
 
 
@@ -409,6 +475,8 @@ def run_segmentation():
     rejected_count = 0
     skipped_covered_count = 0
     terminated_large_mask_objects = 0
+    terminated_low_score_mask_objects = 0
+    terminated_low_siou_mask_objects = 0
     segmented_seed_records: List[Dict[str, object]] = []
 
     prep_pbar = tqdm(total=total_raw_seeds, desc="Prepare grouped seeds")
@@ -493,6 +561,10 @@ def run_segmentation():
             )
             terminated_large_mask_objects += int(stat_fw["terminated_large_mask_objects"])
             terminated_large_mask_objects += int(stat_bw["terminated_large_mask_objects"])
+            terminated_low_score_mask_objects += int(stat_fw["terminated_low_score_mask_objects"])
+            terminated_low_score_mask_objects += int(stat_bw["terminated_low_score_mask_objects"])
+            terminated_low_siou_mask_objects += int(stat_fw["terminated_low_siou_mask_objects"])
+            terminated_low_siou_mask_objects += int(stat_bw["terminated_low_siou_mask_objects"])
 
         if segmented_count >= args.max_segmented_seeds:
             break
@@ -510,6 +582,10 @@ def run_segmentation():
     print(f"Rejected seeds: {rejected_count}")
     print(f"Skipped already covered seeds: {skipped_covered_count}")
     print(f"Objects terminated by large mask filter: {terminated_large_mask_objects}")
+    if args.min_frame_mask_score > 0.0:
+        print(f"Objects terminated by low mask score: {terminated_low_score_mask_objects}")
+    if args.min_frame_siou > 0.0:
+        print(f"Objects terminated by low s_iou: {terminated_low_siou_mask_objects}")
     print(f"Done! Saved to {final_path}")
     if args.enable_segmented_seed_logging:
         segmented_seed_log_path = os.path.join(args.output_dir, args.segmented_seed_log_filename)

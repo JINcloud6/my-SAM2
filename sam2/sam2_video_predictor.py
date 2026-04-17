@@ -549,8 +549,19 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        return_scores=False,
     ):
-        """Propagate the input points across frames to track in the entire video."""
+        """Propagate the input points across frames to track in the entire video.
+
+        If ``return_scores`` is True, yield a fourth item containing per-object
+        SAM decoder scores:
+          - ``siou``: selected-mask predicted IoU score, shape [num_obj, 1]
+          - ``raw_ious``: raw IoU predictions before taking max, shape [num_obj, M]
+          - ``object_score_logits``: object-presence logits, shape [num_obj, 1]
+          - ``sobj``: sigmoid(object_score_logits), shape [num_obj, 1]
+
+        The default return signature is unchanged for compatibility.
+        """
         self.propagate_in_video_preflight(inference_state)
 
         obj_ids = inference_state["obj_ids"]
@@ -582,6 +593,10 @@ class SAM2VideoPredictor(SAM2Base):
 
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             pred_masks_per_obj = [None] * batch_size
+            if return_scores:
+                raw_ious_per_obj = [None] * batch_size
+                siou_per_obj = [None] * batch_size
+                object_score_logits_per_obj = [None] * batch_size
             for obj_idx in range(batch_size):
                 obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                 # We skip those frames already in consolidated outputs (these are frames
@@ -617,6 +632,30 @@ class SAM2VideoPredictor(SAM2Base):
                     "reverse": reverse
                 }
                 pred_masks_per_obj[obj_idx] = pred_masks
+                if return_scores:
+                    device = inference_state["device"]
+                    raw_ious = current_out.get("ious", None)
+                    if raw_ious is None:
+                        raw_ious = pred_masks.new_ones((1, 1))
+                    raw_ious = raw_ious.to(device, non_blocking=True).float()
+                    if raw_ious.dim() == 1:
+                        raw_ious = raw_ious[:, None]
+                    raw_ious = raw_ious.view(raw_ious.shape[0], -1)
+                    # In multimask tracking, SAM2 selects the mask with the best IoU
+                    # prediction, so max(raw_ious) is the selected mask's s_iou.
+                    siou = torch.max(raw_ious, dim=1, keepdim=True).values
+
+                    obj_score_logits = current_out.get("object_score_logits", None)
+                    if obj_score_logits is None:
+                        obj_score_logits = pred_masks.new_full((1, 1), 10.0)
+                    obj_score_logits = obj_score_logits.to(device, non_blocking=True).float()
+                    if obj_score_logits.dim() == 1:
+                        obj_score_logits = obj_score_logits[:, None]
+                    obj_score_logits = obj_score_logits.view(obj_score_logits.shape[0], -1)[:, :1]
+
+                    raw_ious_per_obj[obj_idx] = raw_ious
+                    siou_per_obj[obj_idx] = siou
+                    object_score_logits_per_obj[obj_idx] = obj_score_logits
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
@@ -627,7 +666,25 @@ class SAM2VideoPredictor(SAM2Base):
             _, video_res_masks = self._get_orig_video_res_output(
                 inference_state, all_pred_masks
             )
-            yield frame_idx, obj_ids, video_res_masks
+            if return_scores:
+                max_raw_iou_count = max(raw_ious.shape[1] for raw_ious in raw_ious_per_obj)
+                padded_raw_ious_per_obj = [
+                    F.pad(raw_ious, (0, max_raw_iou_count - raw_ious.shape[1]), value=float("nan"))
+                    if raw_ious.shape[1] < max_raw_iou_count
+                    else raw_ious
+                    for raw_ious in raw_ious_per_obj
+                ]
+                raw_ious = torch.cat(padded_raw_ious_per_obj, dim=0)
+                object_score_logits = torch.cat(object_score_logits_per_obj, dim=0)
+                output_scores = {
+                    "siou": torch.cat(siou_per_obj, dim=0),
+                    "raw_ious": raw_ious,
+                    "object_score_logits": object_score_logits,
+                    "sobj": torch.sigmoid(object_score_logits),
+                }
+                yield frame_idx, obj_ids, video_res_masks, output_scores
+            else:
+                yield frame_idx, obj_ids, video_res_masks
 
     @torch.inference_mode()
     def clear_all_prompts_in_frame(
@@ -857,11 +914,13 @@ class SAM2VideoPredictor(SAM2Base):
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out["object_score_logits"]
+        ious = current_out.get("ious", None)
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
+            "ious": ious,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }

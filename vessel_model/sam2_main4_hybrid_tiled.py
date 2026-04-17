@@ -151,6 +151,8 @@ def get_args():
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
     parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
+    parser.add_argument("--min_frame_mask_score", type=float, default=0.0)
+    parser.add_argument("--min_frame_siou", type=float, default=0.0)
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--disable_joint_init", action="store_true")
     parser.add_argument(
@@ -288,6 +290,8 @@ def build_child_cmd(
         "max_segmented_seeds",
         "max_slice_mask_area",
         "max_slice_mask_ratio",
+        "min_frame_mask_score",
+        "min_frame_siou",
         "joint_init_axis_mode",
         "init_half_window",
         "top_k",

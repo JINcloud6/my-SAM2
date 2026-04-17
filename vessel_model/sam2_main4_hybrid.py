@@ -59,6 +59,24 @@ def get_args():
     parser.add_argument("--max_segmented_seeds", type=int, default=200)
     parser.add_argument("--max_slice_mask_area", type=int, default=12000)
     parser.add_argument("--max_slice_mask_ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--min_frame_mask_score",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, terminate the current SAM2 tracking direction before writing a frame "
+            "when the mean sigmoid score inside the predicted mask is below this threshold."
+        ),
+    )
+    parser.add_argument(
+        "--min_frame_siou",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, request per-frame SAM2 decoder s_iou scores and terminate the current "
+            "tracking direction before writing a frame when s_iou is below this threshold."
+        ),
+    )
 
     parser.add_argument("--enable_seed_judge", action="store_true")
     parser.add_argument("--disable_joint_init", action="store_true")
@@ -298,6 +316,8 @@ def run_segmentation():
     complex_reason_combo_counts: Dict[str, int] = {}
     segmented_original_count = 0
     segmented_respawn_count = 0
+    low_score_termination_count = 0
+    low_siou_termination_count = 0
     segmented_seed_records: List[Dict[str, object]] = []
 
     pbar = tqdm(total=len(pending), desc="Tracking (SAM2 hybrid)")
@@ -397,6 +417,10 @@ def run_segmentation():
         stable_segment_count += int(stat_fw["stable_segments"]) + int(stat_bw["stable_segments"])
         complex_segment_count += int(stat_fw["complex_segments"]) + int(stat_bw["complex_segments"])
         failure_segment_count += int(stat_fw["failure_segments"]) + int(stat_bw["failure_segments"])
+        low_score_termination_count += int(bool(stat_fw.get("terminated_low_score_mask", False)))
+        low_score_termination_count += int(bool(stat_bw.get("terminated_low_score_mask", False)))
+        low_siou_termination_count += int(bool(stat_fw.get("terminated_low_siou_mask", False)))
+        low_siou_termination_count += int(bool(stat_bw.get("terminated_low_siou_mask", False)))
         for key, value in stat_fw["complex_reason_counts"].items():
             complex_reason_counts[key] = int(complex_reason_counts.get(key, 0)) + int(value)
         for key, value in stat_bw["complex_reason_counts"].items():
@@ -446,6 +470,10 @@ def run_segmentation():
         print(f"Segmented respawn seeds: {segmented_respawn_count}")
     print(f"Rejected seeds: {rejected_count}")
     print(f"Respawned seeds queued: {respawned_count}")
+    if args.min_frame_mask_score > 0.0:
+        print(f"Tracking directions terminated by low mask score: {low_score_termination_count}")
+    if args.min_frame_siou > 0.0:
+        print(f"Tracking directions terminated by low s_iou: {low_siou_termination_count}")
     print(f"Promoted long-term segments: {promoted_longterm}")
     if args.enable_respawn:
         print(f"Trusted segments: {trusted_segment_count}")
