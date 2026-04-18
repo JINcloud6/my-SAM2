@@ -1,5 +1,4 @@
-#main2的原版，即只使用视频追踪分割，不去判别新种子
-#可视化memory
+# main2 的原版：只使用视频追踪分割，不去判别新种子
 import argparse
 import os
 import shutil
@@ -17,7 +16,7 @@ from .data_manager import VolumeManager
 from .preprocessing import get_multi_axis_init_seg, get_seeds_from_init_seg, get_seg
 from .sam2_baseline.predict_utils import map_local_point
 from .sam2_baseline.tracking import vos_track_one_direction
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
 def get_args():
@@ -95,28 +94,6 @@ def run_segmentation():
     # --- build SAM2 video predictor (for VOS tracking) ---
     video_predictor = build_sam2_video_predictor(args.sam2_model_cfg, args.sam2_checkpoint, device=device)
 
-    from sam2.modeling.sam.transformer import RoPEAttention
-
-    # def find_cross_rope_attention(model):
-    #     candidates = []
-    #     for name, m in model.named_modules():
-    #         if isinstance(m, RoPEAttention):
-    #             candidates.append((name, m))
-    #     # 优先挑 cross_attn_image（更接近 memory cross-attn）
-    #     for name, m in reversed(candidates):
-    #         if "cross_attn_image" in name or "memory_attention" in name:
-    #             return name, m
-    #     # 退化：取最后一个 RoPEAttention（通常更靠后、可解释性更强）
-    #     return candidates[-1] if candidates else (None, None)
-
-    # rope_name, rope_attn = find_cross_rope_attention(video_predictor)
-    # print("Hook RoPEAttention:", rope_name)
-    rope_attn = None
-    # if rope_attn is None:
-    #     raise RuntimeError("Cannot find RoPEAttention in video_predictor.")
-    # rope_attn.save_attention = True
-
-
     seeds = []
     if args.seed_file:
         with open(args.seed_file, "r", encoding="utf-8") as f:
@@ -181,7 +158,7 @@ def run_segmentation():
     os.makedirs(vos_tmp_root, exist_ok=True)
 
     with tqdm(total=len(seeds), desc="Tracking (SAM2 VOS)") as pbar:
-        for seed_index, seed in enumerate(seeds):
+        for seed in seeds:
             pbar.update(1)
             z, y, x = seed
             if vol_man.global_mask[z, y, x] > 0:
@@ -241,9 +218,6 @@ def run_segmentation():
                 global_update_axis=best_axis,
                 vos_tmp_root=vos_tmp_root,
                 offload_video_to_cpu=args.vos_offload_video_to_cpu,
-                rope_attn=rope_attn,
-                log_prefix=f"seed{seed_index}_axis{best_axis}_fw",
-                img_predictor=img_predictor,
             )
             # backward
             vos_track_one_direction(
@@ -256,9 +230,6 @@ def run_segmentation():
                 global_update_axis=best_axis,
                 vos_tmp_root=vos_tmp_root,
                 offload_video_to_cpu=args.vos_offload_video_to_cpu,
-                rope_attn=rope_attn,
-                log_prefix=f"seed{seed_index}_axis{best_axis}_bw",
-                img_predictor=img_predictor,
             )
 
     if (not args.keep_tmp_vos_frames) and os.path.isdir(vos_tmp_root):

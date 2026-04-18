@@ -27,9 +27,10 @@ def vos_track_one_direction(
     global_update_axis,
     vos_tmp_root,
     offload_video_to_cpu,
-    rope_attn,
+    rope_attn=None,
     log_prefix="human",
     img_predictor=None,
+    collect_metrics=False,
 ):
     """
     Use SAM2 video predictor to propagate init_mask_2d across frames in idx_list.
@@ -51,17 +52,18 @@ def vos_track_one_direction(
     tmp_dir = tempfile.mkdtemp(prefix="sam2_vos_", dir=vos_tmp_root)
     write_jpeg_frames(frames_rgb, tmp_dir)
 
-    ent_curve = []
-    top1_curve = []
-    ptr_curve = []
-    ent_samples_per_frame = []
-    top1_samples_per_frame = []
-    ptr_samples_per_frame = []
-    gap_iou_curve = []
-    gap_iou_samples = []
-    ptr_heat_sum = None
-    ptr_heat_count = 0
-    base_frame = frames_rgb[0] if frames_rgb else None
+    if collect_metrics:
+        ent_curve = []
+        top1_curve = []
+        ptr_curve = []
+        ent_samples_per_frame = []
+        top1_samples_per_frame = []
+        ptr_samples_per_frame = []
+        gap_iou_curve = []
+        gap_iou_samples = []
+        ptr_heat_sum = None
+        ptr_heat_count = 0
+        base_frame = frames_rgb[0] if frames_rgb else None
 
     try:
         with torch.inference_mode(), torch.autocast(str(vol_man.device), dtype=torch.bfloat16):
@@ -98,115 +100,113 @@ def vos_track_one_direction(
                 if mm.sum() == 0:
                     continue
 
-                attn = getattr(rope_attn, "last_attn", None)
-                if attn is None:
-                    ent_curve.append(np.nan)
-                    top1_curve.append(np.nan)
-                    ptr_curve.append(np.nan)
-                else:
-                    ent_curve.append(mean_attn_entropy(attn))
-                    top1_curve.append(mean_attn_top1(attn))
-                    ptr_curve.append(mean_pointer_mass(attn, getattr(rope_attn, "last_num_k_exclude_rope", 0)))
-
-                num_ptr = int(getattr(rope_attn, "last_num_k_exclude_rope", 0))
-                query_mask = _make_query_mask(attn, mm)
-                if attn is None:
-                    ent_samples_per_frame.append(None)
-                    top1_samples_per_frame.append(None)
-                    ptr_samples_per_frame.append(None)
-                else:
-                    ent_s, top1_s, ptr_s = sample_query_metrics_from_attn(
-                        attn,
-                        num_ptr=num_ptr,
-                        max_q=512,
-                        query_mask=query_mask,
-                    )
-                    ent_samples_per_frame.append(ent_s)
-                    top1_samples_per_frame.append(top1_s)
-                    ptr_samples_per_frame.append(ptr_s)
-
-                ptr_map = _memory_pointer_heatmap(attn, num_ptr)
-                if ptr_map is not None:
-                    if ptr_heat_sum is None:
-                        ptr_heat_sum = ptr_map.astype(np.float32)
+                if collect_metrics:
+                    attn = getattr(rope_attn, "last_attn", None) if rope_attn is not None else None
+                    if attn is None:
+                        ent_curve.append(np.nan)
+                        top1_curve.append(np.nan)
+                        ptr_curve.append(np.nan)
                     else:
-                        ptr_heat_sum += ptr_map.astype(np.float32)
-                    ptr_heat_count += 1
+                        ent_curve.append(mean_attn_entropy(attn))
+                        top1_curve.append(mean_attn_top1(attn))
+                        ptr_curve.append(
+                            mean_pointer_mass(
+                                attn, getattr(rope_attn, "last_num_k_exclude_rope", 0)
+                            )
+                        )
 
-                if img_predictor is None:
-                    gap_iou_curve.append(np.nan)
-                    gap_iou_samples.append(None)
-                else:
-                    gap_iou = gap_iou_from_resegment(img_predictor, frames_rgb[f_idx], mm)
-                    if gap_iou is None:
+                    num_ptr = int(getattr(rope_attn, "last_num_k_exclude_rope", 0)) if rope_attn is not None else 0
+                    query_mask = _make_query_mask(attn, mm)
+                    if attn is None:
+                        ent_samples_per_frame.append(None)
+                        top1_samples_per_frame.append(None)
+                        ptr_samples_per_frame.append(None)
+                    else:
+                        ent_s, top1_s, ptr_s = sample_query_metrics_from_attn(
+                            attn,
+                            num_ptr=num_ptr,
+                            max_q=512,
+                            query_mask=query_mask,
+                        )
+                        ent_samples_per_frame.append(ent_s)
+                        top1_samples_per_frame.append(top1_s)
+                        ptr_samples_per_frame.append(ptr_s)
+
+                    ptr_map = _memory_pointer_heatmap(attn, num_ptr)
+                    if ptr_map is not None:
+                        if ptr_heat_sum is None:
+                            ptr_heat_sum = ptr_map.astype(np.float32)
+                        else:
+                            ptr_heat_sum += ptr_map.astype(np.float32)
+                        ptr_heat_count += 1
+
+                    if img_predictor is None:
                         gap_iou_curve.append(np.nan)
                         gap_iou_samples.append(None)
                     else:
-                        gap_iou_curve.append(gap_iou)
-                        gap_iou_samples.append(np.array([gap_iou], dtype=np.float32))
+                        gap_iou = gap_iou_from_resegment(img_predictor, frames_rgb[f_idx], mm)
+                        if gap_iou is None:
+                            gap_iou_curve.append(np.nan)
+                            gap_iou_samples.append(None)
+                        else:
+                            gap_iou_curve.append(gap_iou)
+                            gap_iou_samples.append(np.array([gap_iou], dtype=np.float32))
 
                 vol_man.update_global_mask(mm, global_update_axis, (idx_list[f_idx], *box[1:]))
     finally:
-        os.makedirs(os.path.join("./data/macaque", "attn_viz"), exist_ok=True)
-        out_dir = os.path.join("./data/human", "attn_viz")
+        if collect_metrics:
+            out_dir = os.path.join(vos_tmp_root, "attn_viz")
+            os.makedirs(out_dir, exist_ok=True)
+            _plot_curve(ent_curve, "entropy", log_prefix, out_dir)
+            _plot_curve(top1_curve, "top1 mass", log_prefix, out_dir)
+            _plot_curve(ptr_curve, "pointer mass", log_prefix, out_dir)
+            _plot_curve(gap_iou_curve, "gap IoU (video vs image)", log_prefix, out_dir)
 
-        os.makedirs(out_dir, exist_ok=True)
-        _plot_curve(ent_curve, "entropy", log_prefix, out_dir)
-        _plot_curve(top1_curve, "top1 mass", log_prefix, out_dir)
-        _plot_curve(ptr_curve, "pointer mass", log_prefix, out_dir)
-        _plot_curve(gap_iou_curve, "gap IoU (video vs image)", log_prefix, out_dir)
-
-        out_dir = os.path.join(vos_tmp_root, "attn_viz")
-        os.makedirs(out_dir, exist_ok=True)
-
-        plot_time_value_heatmap(
-            ent_samples_per_frame,
-            title=f"{log_prefix} entropy dist",
-            savepath=os.path.join(out_dir, f"{log_prefix}_entropy_heat.png"),
-            n_time_bins=50,
-            n_val_bins=50,
-            log_scale=True,
-        )
-
-        plot_time_value_heatmap(
-            top1_samples_per_frame,
-            title=f"{log_prefix} top1 dist",
-            savepath=os.path.join(out_dir, f"{log_prefix}_top1_heat.png"),
-            n_time_bins=50,
-            n_val_bins=50,
-            log_scale=True,
-        )
-
-        plot_time_value_heatmap(
-            ptr_samples_per_frame,
-            title=f"{log_prefix} ptrmass dist",
-            savepath=os.path.join(out_dir, f"{log_prefix}_ptrmass_heat.png"),
-            n_time_bins=50,
-            n_val_bins=50,
-            log_scale=True,
-        )
-
-        plot_time_value_heatmap(
-            gap_iou_samples,
-            title=f"{log_prefix} gap IoU dist",
-            savepath=os.path.join(out_dir, f"{log_prefix}_gap_iou_heat.png"),
-            n_time_bins=50,
-            n_val_bins=50,
-            log_scale=False,
-            val_range=(0.0, 1.0),
-        )
-
-        if ptr_heat_sum is not None and ptr_heat_count > 0:
-            mean_ptr_heat = ptr_heat_sum / float(ptr_heat_count)
-            plot_spatial_heatmap(
-                mean_ptr_heat,
-                savepath=os.path.join(out_dir, f"{log_prefix}_memory_ptr_heat.png"),
+            plot_time_value_heatmap(
+                ent_samples_per_frame,
+                title=f"{log_prefix} entropy dist",
+                savepath=os.path.join(out_dir, f"{log_prefix}_entropy_heat.png"),
+                n_time_bins=50,
+                n_val_bins=50,
+                log_scale=True,
             )
-            plot_spatial_heatmap(
-                mean_ptr_heat,
-                savepath=os.path.join(out_dir, f"{log_prefix}_memory_ptr_overlay.png"),
-                base_image=base_frame,
+            plot_time_value_heatmap(
+                top1_samples_per_frame,
+                title=f"{log_prefix} top1 dist",
+                savepath=os.path.join(out_dir, f"{log_prefix}_top1_heat.png"),
+                n_time_bins=50,
+                n_val_bins=50,
+                log_scale=True,
             )
+            plot_time_value_heatmap(
+                ptr_samples_per_frame,
+                title=f"{log_prefix} ptrmass dist",
+                savepath=os.path.join(out_dir, f"{log_prefix}_ptrmass_heat.png"),
+                n_time_bins=50,
+                n_val_bins=50,
+                log_scale=True,
+            )
+            plot_time_value_heatmap(
+                gap_iou_samples,
+                title=f"{log_prefix} gap IoU dist",
+                savepath=os.path.join(out_dir, f"{log_prefix}_gap_iou_heat.png"),
+                n_time_bins=50,
+                n_val_bins=50,
+                log_scale=False,
+                val_range=(0.0, 1.0),
+            )
+
+            if ptr_heat_sum is not None and ptr_heat_count > 0:
+                mean_ptr_heat = ptr_heat_sum / float(ptr_heat_count)
+                plot_spatial_heatmap(
+                    mean_ptr_heat,
+                    savepath=os.path.join(out_dir, f"{log_prefix}_memory_ptr_heat.png"),
+                )
+                plot_spatial_heatmap(
+                    mean_ptr_heat,
+                    savepath=os.path.join(out_dir, f"{log_prefix}_memory_ptr_overlay.png"),
+                    base_image=base_frame,
+                )
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

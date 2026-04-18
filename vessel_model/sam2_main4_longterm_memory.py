@@ -7,6 +7,8 @@ import argparse
 import os
 import shutil
 import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -20,17 +22,19 @@ from sam2.build_sam import build_sam2, build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 from .data_manager import VolumeManager
+from .global_memory_pool import GlobalMemoryPool
 from .preprocessing import get_multi_axis_init_seg, get_seeds_from_init_seg, get_seg
 from .sam2_baseline.image_utils import get_slice, to_uint8_rgb, write_jpeg_frames
 from .sam2_baseline.predict_utils import map_local_point
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 EPS = 1e-6
 
 
 @dataclass
 class FrameQuality:
     frame_idx: int
+    physical_frame_idx: int
     mask: np.ndarray
     quality: float
 
@@ -70,6 +74,8 @@ def get_args():
                         help="long-term最大段数")
     parser.add_argument("--working_window", type=int, default=24,
                         help="保留最近working输出帧数")
+    parser.add_argument("--max_global_inject_per_seed", type=int, default=0,
+                        help="每个seed启动时最多注入的全局记忆帧数")
 
     parser.add_argument("--vos_offload_video_to_cpu", action="store_true")
     parser.add_argument("--keep_tmp_vos_frames", action="store_true")
@@ -121,44 +127,15 @@ def frame_quality_from_logits(mask_logits, mask_bin, prev_mask):
     return 0.7 * conf + 0.3 * stab
 
 
-def _safe_get_output_dict(state):
-    if not isinstance(state, dict):
-        return None
-    od = state.get("output_dict", None)
-    if not isinstance(od, dict):
-        return None
-    return od
-
-
-def prune_working_non_cond_outputs(state, min_keep_frame_idx):
-    """尽量裁剪 state 内过旧的 non-cond 输出，模拟working window。"""
-    od = _safe_get_output_dict(state)
-    if od is None:
-        return
-    nc = od.get("non_cond_frame_outputs", None)
-    if not isinstance(nc, dict):
-        return
-
-    drop_keys = [k for k in list(nc.keys()) if isinstance(k, int) and k < min_keep_frame_idx]
-    for k in drop_keys:
-        nc.pop(k, None)
-
-
-def remove_longterm_rep_from_cond_outputs(state, frame_idx):
-    od = _safe_get_output_dict(state)
-    if od is None:
-        return
-    c = od.get("cond_frame_outputs", None)
-    if not isinstance(c, dict):
-        return
-    c.pop(frame_idx, None)
-
-
 def promote_segment_to_longterm(
     video_predictor,
     state,
     seg_frames: List[FrameQuality],
     longterm_bank: List[LongTermSegment],
+    global_memory_pool: GlobalMemoryPool,
+    axis: int,
+    seed: Tuple[int, int, int],
+    direction: str,
     args,
 ):
     if len(seg_frames) == 0:
@@ -168,8 +145,8 @@ def promote_segment_to_longterm(
     if seg_q < args.longterm_quality_thr:
         return
 
-    # 将整个高质量段写入 SAM2 cond memory（而非仅代表帧）
-    # 同一frame若重复出现，仅保留该段内质量最高的mask。
+    # 将整个高质量段提升为 SAM2 cond memory（真正参与 memory attention）
+    # 同一 frame 若重复出现，仅保留该段内质量最高的结果。
     best_per_frame: Dict[int, FrameQuality] = {}
     for item in seg_frames:
         prev = best_per_frame.get(item.frame_idx, None)
@@ -181,20 +158,27 @@ def promote_segment_to_longterm(
         return
 
     for item in ordered_items:
-        video_predictor.add_new_mask(
-            state,
-            frame_idx=item.frame_idx,
-            obj_id=1,
-            mask=item.mask.astype(bool),
+        video_predictor.promote_frame_output_to_cond(
+            state, frame_idx=item.frame_idx, obj_id=1
+        )
+        global_memory_pool.add_entry(
+            axis=axis,
+            physical_frame_idx=item.physical_frame_idx,
+            mask=item.mask,
+            quality=item.quality,
+            source_seed=seed,
+            source_direction=direction,
         )
     longterm_bank.append(LongTermSegment(frame_items=ordered_items, seg_quality=seg_q))
 
-    # 若超容量，删掉质量最低 long-term 段（并从 cond outputs 尝试移除整段）
+    # 若超容量，降级质量最低 long-term 段
     while len(longterm_bank) > args.max_longterm_segments:
         worst_idx = int(np.argmin([x.seg_quality for x in longterm_bank]))
         worst = longterm_bank.pop(worst_idx)
         for item in worst.frame_items:
-            remove_longterm_rep_from_cond_outputs(state, item.frame_idx)
+            video_predictor.demote_frame_output_from_cond(
+                state, frame_idx=item.frame_idx, obj_id=1
+            )
 
 
 def build_frames_rgb(vol_man, axis, box, idx_list):
@@ -222,6 +206,9 @@ def longterm_track_one_direction(
     global_update_axis,
     vos_tmp_root,
     offload_video_to_cpu,
+    global_memory_pool: GlobalMemoryPool,
+    seed: Tuple[int, int, int],
+    direction: str,
     args,
 ):
     if len(idx_list) == 0:
@@ -258,6 +245,23 @@ def longterm_track_one_direction(
                 m0 = (m0 > 0).astype(np.uint8)
             vol_man.update_global_mask(m0, global_update_axis, (valid_gidx[0], *box[1:]))
 
+            init_radius = float(np.sqrt(float(np.count_nonzero(m0)) / np.pi)) if int(m0.sum()) > 0 else 0.0
+            phys_to_local = {int(p): i for i, p in enumerate(valid_gidx)}
+            inject_items = global_memory_pool.select_for_injection(
+                axis=axis,
+                current_seed=seed,
+                current_radius=init_radius,
+                physical_to_local=phys_to_local,
+                max_inject=args.max_global_inject_per_seed,
+            )
+            for local_idx, mem_entry in inject_items:
+                video_predictor.add_new_mask(
+                    state,
+                    frame_idx=local_idx,
+                    obj_id=1,
+                    mask=mem_entry.mask.astype(bool),
+                )
+
             # long-term/working 管理缓存（都在同一个state内进行，不重载video）
             longterm_bank: List[LongTermSegment] = []
             seg_cache: List[FrameQuality] = []
@@ -279,12 +283,24 @@ def longterm_track_one_direction(
                 vol_man.update_global_mask(mm, global_update_axis, (valid_gidx[f_idx], *box[1:]))
 
                 q = frame_quality_from_logits(mm_logits, mm, prev_mask)
-                seg_cache.append(FrameQuality(frame_idx=f_idx, mask=mm, quality=float(q)))
+                seg_cache.append(
+                    FrameQuality(
+                        frame_idx=f_idx,
+                        physical_frame_idx=int(valid_gidx[f_idx]),
+                        mask=mm,
+                        quality=float(q),
+                    )
+                )
                 prev_mask = mm
 
-                # working窗口裁剪（近似）
+                # 裁剪 working memory（non-cond）
                 min_keep = max(0, f_idx - args.working_window)
-                prune_working_non_cond_outputs(state, min_keep_frame_idx=min_keep)
+                video_predictor.prune_non_cond_memory(
+                    state,
+                    min_keep_frame_idx=min_keep,
+                    obj_id=1,
+                    keep_cond=True,
+                )
 
                 # 到段尾就判断是否提升为long-term
                 if len(seg_cache) >= args.segment_len:
@@ -293,6 +309,10 @@ def longterm_track_one_direction(
                         state=state,
                         seg_frames=seg_cache,
                         longterm_bank=longterm_bank,
+                        global_memory_pool=global_memory_pool,
+                        axis=axis,
+                        seed=seed,
+                        direction=direction,
                         args=args,
                     )
                     seg_cache = []
@@ -304,6 +324,10 @@ def longterm_track_one_direction(
                     state=state,
                     seg_frames=seg_cache,
                     longterm_bank=longterm_bank,
+                    global_memory_pool=global_memory_pool,
+                    axis=axis,
+                    seed=seed,
+                    direction=direction,
                     args=args,
                 )
 
@@ -386,8 +410,10 @@ def run_segmentation():
 
     print(f"Starting SAM2 segmentation with long-term memory over {len(seeds)} seeds...")
 
-    vos_tmp_root = os.path.join(args.output_dir, "_tmp_sam2_vos_lt")
+    run_tag = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    vos_tmp_root = os.path.join(args.output_dir, f"_tmp_sam2_vos_lt_{run_tag}")
     os.makedirs(vos_tmp_root, exist_ok=True)
+    global_memory_pool = GlobalMemoryPool()
 
     with tqdm(total=len(seeds), desc="Tracking (SAM2 long-term-memory)") as pbar:
         for seed in seeds:
@@ -440,6 +466,9 @@ def run_segmentation():
                 global_update_axis=best_axis,
                 vos_tmp_root=vos_tmp_root,
                 offload_video_to_cpu=args.vos_offload_video_to_cpu,
+                global_memory_pool=global_memory_pool,
+                seed=seed,
+                direction="forward",
                 args=args,
             )
             longterm_track_one_direction(
@@ -452,6 +481,9 @@ def run_segmentation():
                 global_update_axis=best_axis,
                 vos_tmp_root=vos_tmp_root,
                 offload_video_to_cpu=args.vos_offload_video_to_cpu,
+                global_memory_pool=global_memory_pool,
+                seed=seed,
+                direction="backward",
                 args=args,
             )
 
