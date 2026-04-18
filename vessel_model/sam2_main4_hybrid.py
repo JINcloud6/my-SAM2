@@ -94,6 +94,34 @@ def get_args():
     parser.add_argument("--top_k", type=int, default=6)
     parser.add_argument("--num_point_jitters", type=int, default=3)
     parser.add_argument("--jitter_radius", type=float, default=6.0)
+    parser.add_argument(
+        "--point_sample_radius",
+        type=float,
+        default=None,
+        help=(
+            "Sampling radius/std for MSJI jittered point prompts. If provided, this "
+            "overrides --jitter_radius; if omitted, the legacy --jitter_radius value is used."
+        ),
+    )
+    parser.add_argument(
+        "--joint_energy_mode",
+        default="legacy_weighted",
+        choices=["legacy_weighted", "unweighted_terms"],
+        help=(
+            "Energy formula used by MSJI dynamic programming. 'legacy_weighted' keeps the "
+            "original weighted formula. 'unweighted_terms' sums the terms listed in "
+            "--joint_energy_terms directly, avoiding extra term weights."
+        ),
+    )
+    parser.add_argument(
+        "--joint_energy_terms",
+        default="score,iou,centroid_radius,area_log",
+        help=(
+            "Comma or plus separated terms for --joint_energy_mode unweighted_terms. "
+            "Unary terms: score, empty. Pairwise terms: iou, dice, centroid_radius, "
+            "centroid_diag, area_log, radius_log, area_ratio, radius_ratio, containment, empty_pair."
+        ),
+    )
     parser.add_argument("--w_score", type=float, default=1.0)
     parser.add_argument("--w_iou", type=float, default=3.0)
     parser.add_argument("--w_centroid", type=float, default=0.03)

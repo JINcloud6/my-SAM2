@@ -56,6 +56,9 @@ VALUE_ARG_NAMES = [
     "top_k",
     "num_point_jitters",
     "jitter_radius",
+    "point_sample_radius",
+    "joint_energy_mode",
+    "joint_energy_terms",
     "w_score",
     "w_iou",
     "w_centroid",
@@ -138,6 +141,8 @@ def build_ablation_combinations(mode: str) -> List[Tuple[bool, bool, bool]]:
         return [(False, True, True), (True, False, True), (True, True, False), (True, True, True)]
     if mode == "single_idea":
         return [(False, False, False), (True, False, False), (False, True, False), (False, False, True)]
+    if mode == "test_respawn":
+        return [(True,True,True),(True,False,True)]
     raise ValueError(f"Unsupported ablation mode: {mode}")
 
 
@@ -301,7 +306,7 @@ def get_args():
     parser.add_argument(
         "--ablation_mode",
         default="all",
-        choices=["all", "leave_one_out", "single_idea", "full_only", "baseline_only"],
+        choices=["all", "leave_one_out", "single_idea", "full_only", "baseline_only", "test_respawn"],
         help="Which joint/respawn/longterm combinations to run.",
     )
     parser.add_argument("--result_prefix", default="")
@@ -337,6 +342,9 @@ def get_args():
     parser.add_argument("--top_k", type=int, default=6)
     parser.add_argument("--num_point_jitters", type=int, default=3)
     parser.add_argument("--jitter_radius", type=float, default=6.0)
+    parser.add_argument("--point_sample_radius", type=float, default=None)
+    parser.add_argument("--joint_energy_mode", default="legacy_weighted", choices=["legacy_weighted", "unweighted_terms"])
+    parser.add_argument("--joint_energy_terms", default="score,iou,centroid_radius,area_log")
     parser.add_argument("--w_score", type=float, default=1.0)
     parser.add_argument("--w_iou", type=float, default=3.0)
     parser.add_argument("--w_centroid", type=float, default=0.03)

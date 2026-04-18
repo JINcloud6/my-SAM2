@@ -164,6 +164,9 @@ def get_args():
     parser.add_argument("--top_k", type=int, default=6)
     parser.add_argument("--num_point_jitters", type=int, default=3)
     parser.add_argument("--jitter_radius", type=float, default=6.0)
+    parser.add_argument("--point_sample_radius", type=float, default=None)
+    parser.add_argument("--joint_energy_mode", default="legacy_weighted", choices=["legacy_weighted", "unweighted_terms"])
+    parser.add_argument("--joint_energy_terms", default="score,iou,centroid_radius,area_log")
     parser.add_argument("--w_score", type=float, default=1.0)
     parser.add_argument("--w_iou", type=float, default=3.0)
     parser.add_argument("--w_centroid", type=float, default=0.03)
@@ -297,6 +300,9 @@ def build_child_cmd(
         "top_k",
         "num_point_jitters",
         "jitter_radius",
+        "point_sample_radius",
+        "joint_energy_mode",
+        "joint_energy_terms",
         "w_score",
         "w_iou",
         "w_centroid",

@@ -9,6 +9,20 @@ from ..sam2_baseline.predict_utils import map_local_point
 from .common import select_mask_with_constraints
 
 EPS = 1e-6
+UNARY_ENERGY_TERMS = {"score", "empty"}
+PAIRWISE_ENERGY_TERMS = {
+    "iou",
+    "dice",
+    "centroid_radius",
+    "centroid_diag",
+    "area_log",
+    "radius_log",
+    "area_ratio",
+    "radius_ratio",
+    "containment",
+    "empty_pair",
+}
+JOINT_ENERGY_TERMS = UNARY_ENERGY_TERMS | PAIRWISE_ENERGY_TERMS
 
 
 @dataclass
@@ -41,6 +55,40 @@ def iou(mask_a, mask_b):
     return float(inter) / float(uni) if uni > 0 else 0.0
 
 
+def dice(mask_a, mask_b):
+    a = mask_a.astype(bool)
+    b = mask_b.astype(bool)
+    denom = a.sum() + b.sum()
+    if denom <= 0:
+        return 0.0
+    inter = np.logical_and(a, b).sum()
+    return float(2.0 * inter) / float(denom)
+
+
+def equivalent_radius(area):
+    area = float(max(float(area), 0.0))
+    return float(np.sqrt(area / np.pi)) if area > 0 else 0.0
+
+
+def parse_joint_energy_terms(args):
+    terms = getattr(args, "joint_energy_terms", "score,iou,centroid_radius,area_log")
+    if terms is None:
+        return []
+    if isinstance(terms, (list, tuple)):
+        raw_terms = terms
+    else:
+        raw_terms = str(terms).replace("+", ",").split(",")
+    parsed = []
+    for term in raw_terms:
+        t = str(term).strip().lower()
+        if t:
+            if t not in JOINT_ENERGY_TERMS:
+                valid = ", ".join(sorted(JOINT_ENERGY_TERMS))
+                raise ValueError(f"Unsupported joint energy term '{t}'. Valid terms: {valid}")
+            parsed.append(t)
+    return parsed
+
+
 def unary_cost(c, w_score, empty_mask_penalty):
     return w_score * (-np.log(c["score"] + EPS)) + (empty_mask_penalty if c["area"] == 0 else 0.0)
 
@@ -53,6 +101,78 @@ def pairwise_cost(a, b, w_iou, w_centroid, w_area):
         centroid_term = float(np.linalg.norm(b["centroid"] - a["centroid"]))
     area_term = abs(np.log(a["area"] + EPS) - np.log(b["area"] + EPS))
     return w_iou * iou_term + w_centroid * centroid_term + w_area * area_term
+
+
+def unweighted_unary_cost(c, terms):
+    cost = 0.0
+    term_set = set(terms)
+    if "score" in term_set:
+        cost += float(-np.log(c["score"] + EPS))
+    if "empty" in term_set:
+        cost += 1.0 if c["area"] == 0 else 0.0
+    return float(cost)
+
+
+def unweighted_pairwise_term_values(a, b):
+    area_a = float(a["area"])
+    area_b = float(b["area"])
+    radius_a = equivalent_radius(area_a)
+    radius_b = equivalent_radius(area_b)
+    mean_radius = 0.5 * (radius_a + radius_b)
+    mean_area = 0.5 * (area_a + area_b)
+
+    if a["centroid"] is None or b["centroid"] is None:
+        centroid_dist = None
+    else:
+        centroid_dist = float(np.linalg.norm(b["centroid"] - a["centroid"]))
+
+    mask_h, mask_w = a["mask"].shape[:2]
+    diag = float(np.sqrt(mask_h * mask_h + mask_w * mask_w))
+    inter = float(np.logical_and(a["mask"].astype(bool), b["mask"].astype(bool)).sum())
+    min_area = min(area_a, area_b)
+
+    if centroid_dist is None:
+        centroid_radius = 1.0
+        centroid_diag = 1.0
+    else:
+        centroid_radius = centroid_dist / (mean_radius + EPS)
+        centroid_diag = centroid_dist / (diag + EPS)
+
+    return {
+        "iou": 1.0 - iou(a["mask"], b["mask"]),
+        "dice": 1.0 - dice(a["mask"], b["mask"]),
+        "centroid_radius": centroid_radius,
+        "centroid_diag": centroid_diag,
+        "area_log": abs(np.log(area_a + EPS) - np.log(area_b + EPS)),
+        "radius_log": abs(np.log(radius_a + EPS) - np.log(radius_b + EPS)),
+        "area_ratio": abs(area_b - area_a) / (mean_area + EPS),
+        "radius_ratio": abs(radius_b - radius_a) / (0.5 * (radius_a + radius_b) + EPS),
+        "containment": 1.0 - (inter / (min_area + EPS)) if min_area > 0 else 1.0,
+        "empty_pair": 1.0 if area_a == 0 or area_b == 0 else 0.0,
+    }
+
+
+def unweighted_pairwise_cost(a, b, terms):
+    vals = unweighted_pairwise_term_values(a, b)
+    return float(sum(vals[t] for t in terms if t in vals))
+
+
+def unary_cost_for_candidate(c, args, energy_terms=None):
+    mode = getattr(args, "joint_energy_mode", "legacy_weighted")
+    if mode == "legacy_weighted":
+        return unary_cost(c, args.w_score, args.empty_mask_penalty)
+    if mode == "unweighted_terms":
+        return unweighted_unary_cost(c, energy_terms or parse_joint_energy_terms(args))
+    raise ValueError(f"Unsupported joint_energy_mode: {mode}")
+
+
+def pairwise_cost_for_candidates(a, b, args, energy_terms=None):
+    mode = getattr(args, "joint_energy_mode", "legacy_weighted")
+    if mode == "legacy_weighted":
+        return pairwise_cost(a, b, args.w_iou, args.w_centroid, args.w_area)
+    if mode == "unweighted_terms":
+        return unweighted_pairwise_cost(a, b, energy_terms or parse_joint_energy_terms(args))
+    raise ValueError(f"Unsupported joint_energy_mode: {mode}")
 
 
 def build_candidates_for_slice(img_predictor, rgb, local_pt, top_k, num_point_jitters, jitter_radius, rng):
@@ -90,15 +210,25 @@ def build_candidates_for_slice(img_predictor, rgb, local_pt, top_k, num_point_ji
     return cands
 
 
+def get_point_sample_radius(args):
+    radius = getattr(args, "point_sample_radius", None)
+    if radius is None:
+        radius = getattr(args, "jitter_radius", 6.0)
+    return float(radius)
+
+
 def dp_best_path_with_energy(layers, args):
     n, k = len(layers), len(layers[0])
     dp = np.full((n, k), np.inf, dtype=np.float64)
     parent = np.full((n, k), -1, dtype=np.int32)
     unary_table = np.zeros((n, k), dtype=np.float64)
+    energy_terms = None
+    if getattr(args, "joint_energy_mode", "legacy_weighted") == "unweighted_terms":
+        energy_terms = parse_joint_energy_terms(args)
 
     for t in range(n):
         for j in range(k):
-            unary_table[t, j] = unary_cost(layers[t][j], args.w_score, args.empty_mask_penalty)
+            unary_table[t, j] = unary_cost_for_candidate(layers[t][j], args, energy_terms)
 
     for j in range(k):
         dp[0, j] = unary_table[0, j]
@@ -108,7 +238,7 @@ def dp_best_path_with_energy(layers, args):
             u = unary_table[t, j]
             best_val, best_i = np.inf, -1
             for i in range(k):
-                p = pairwise_cost(layers[t - 1][i], layers[t][j], args.w_iou, args.w_centroid, args.w_area)
+                p = pairwise_cost_for_candidates(layers[t - 1][i], layers[t][j], args, energy_terms)
                 v = dp[t - 1, i] + u + p
                 if v < best_val:
                     best_val, best_i = v, i
@@ -129,7 +259,7 @@ def dp_best_path_with_energy(layers, args):
             p = 0.0
         else:
             i = path[t - 1]
-            p = pairwise_cost(layers[t - 1][i], layers[t][j], args.w_iou, args.w_centroid, args.w_area)
+            p = pairwise_cost_for_candidates(layers[t - 1][i], layers[t][j], args, energy_terms)
         per_step_energy.append(float(u + p))
 
     return {"path": path, "best_energy": best_energy, "per_step_energy": per_step_energy}
@@ -186,7 +316,13 @@ def build_layers_for_seed(img_predictor, vol_man, seed, axis, box, args, rng):
         if rgb is None:
             rgb = np.zeros((box[2] - box[1], box[4] - box[3], 3), dtype=np.uint8)
         cands = build_candidates_for_slice(
-            img_predictor, rgb, local_pt, args.top_k, args.num_point_jitters, args.jitter_radius, rng
+            img_predictor,
+            rgb,
+            local_pt,
+            args.top_k,
+            args.num_point_jitters,
+            get_point_sample_radius(args),
+            rng,
         )
         layers.append(cands)
     return idxs, layers
